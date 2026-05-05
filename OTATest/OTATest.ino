@@ -18,8 +18,12 @@ bool OTAUpdateEnable = 0;
 //const char* targetMAC_T3 = "68:23:b0:b6:c8:44";
 
 //MAC address for Ross Test sensors
-const char* targetMAC_T2 = "68:23:b0:b6:31:61";
-const char* targetMAC_T3 = "68:23:b0:b7:18:e5";
+// const char* targetMAC_T2 = "68:23:b0:b6:31:61";
+// const char* targetMAC_T3 = "68:23:b0:b7:18:e5";
+
+//MAC address for Jon Test sensors
+const char* targetMAC_T2 = "84:72:93:A5:02:8E";
+const char* targetMAC_T3 = "84:72:93:A5:0B:38";
 
 const char* battServiceUUID   = "180f";
 const char* battCharUUID      = "2A19";
