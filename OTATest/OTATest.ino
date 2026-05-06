@@ -110,13 +110,19 @@ void loop() {
         delay(1000); //delay to allow disconnect
         enterWifiOTA();
 
-      //Signal from ski to change sensitivity (*currently preset levels)
+      //Signal from ski to change sensitivity for  (*currently preset levels) for sensor 0
       case '0':
       case '1':
       case '2':
-        setSensitivity(sensitivityLevels[incomingByte-'0'], sensitivityLevels[incomingByte-'0']);
-        if(COMMS) Serial.print("Sensitivity set to");
-        if(COMMS) Serial.println(sensitivityLevels[incomingByte-'0']);
+        //setBothSensitivitiesSensitivity(sensitivityLevels[incomingByte-'0'], sensitivityLevels[incomingByte-'0']);
+        setSensitivityBySensor(0, sensitivityLevels[incomingByte-'0']);
+        if(COMMS){
+          Serial.println();
+          Serial.print("\nSensitivity for sensor 0 set to ");
+          Serial.print(sensitivityLevels[incomingByte-'0']);
+          Serial.print(" with a threshold of ");
+          Serial.println(t2Threshold);
+        }
         Serial.print('c'); //send confirmation byte to TetraSki
         break;
 
@@ -140,16 +146,21 @@ void loop() {
         Serial.print('f'); //send confirmation byte to TetraSki
         break;
 
-      //FUTURE PER-SENSOR SENSITIVITY CONFIGURATION FOR TETRASKI UI
-      // case '6':
-      // case '7':
-      // case '8':
-      //   setSensitivity(sensitivityLevels[incomingByte-'0'], sensitivityLevels[incomingByte-'0']);
-      //   if(COMMS) Serial.print("Sensitivity set to");
-      //   if(COMMS) Serial.println(sensitivityLevels[incomingByte-'0']);
+      //Signal from ski to change sensitivity for  (*currently preset levels) for sensor 1 (2nd sensor)
+      case '6':
+      case '7':
+      case '8':
+        setSensitivityBySensor(1, sensitivityLevels[incomingByte-'6']);
+        if(COMMS){
+          Serial.println();
+          Serial.print("\nSensitivity for sensor 1 set to ");
+          Serial.print(sensitivityLevels[incomingByte-'6']);
+          Serial.print(" with a threshold of ");
+          Serial.println(t3Threshold);
+        }
 
-      //   Serial.print('c');  //send confirmation byte to TetraSki
-      //   break;
+        Serial.print('c');  //send confirmation byte to TetraSki
+        break;
 
     }
   }
@@ -339,11 +350,26 @@ float computeSlope(uint16_t *buffer) {
 
 
 // --------------------------------------------------
-// Set Sensitivity for each sensor
+// Set Sensitivity for both sensors
 // --------------------------------------------------
-void setSensitivity(uint16_t t2value, uint16_t t3value) {
+void setBothSensitivities(uint16_t t2value, uint16_t t3value) {
   t2Threshold = (t2Ave / sizeOfAve) + t2value;
   t3Threshold = (t3Ave / sizeOfAve) + t3value;
+}
+
+// --------------------------------------------------
+// Set Sensitivity by sensor
+// --------------------------------------------------
+void setSensitivityBySensor(uint16_t sensor, uint16_t value)
+{
+  switch(sensor){
+    case(0):
+      t2Threshold = (t2Ave / sizeOfAve) + value;
+      break;
+    case(1):
+      t3Threshold = (t3Ave / sizeOfAve) + value;
+      break;
+  }
 }
 
 
@@ -371,7 +397,7 @@ void calibrateThreshold() {
     t3Ave += valT3;
   }
 
-  setSensitivity(sensitivityLevels[0], sensitivityLevels[0]);
+  setBothSensitivities(sensitivityLevels[1], sensitivityLevels[1]);
 
   sensors[0].digitalChar.writeValue(greenLED);
   sensors[1].digitalChar.writeValue(greenLED);
