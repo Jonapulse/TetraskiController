@@ -65,6 +65,7 @@ void setup() {
   digitalWrite(26, HIGH);
 
   if (!BLE.begin()) {
+    //NOTE: esp32 3.3.7 breaks BLE. 3.3.6 by Espressif works - as of 2/18/26
     Serial.println("BLE INIT FAILED");
     while(1);
   }
@@ -74,7 +75,7 @@ void setup() {
 
     //attempt to connect again until connection established
     if (connectSensors()) {
-      Serial.print('$');  // Signal successful connection to ski signaling successful connection
+      Serial.print('$');  // Signal successful connection to ski
       break;
     }
 
@@ -226,30 +227,57 @@ bool connectSensors() {
         SensorBLE &sensor = sensors[connectedSensorCount];
         sensor.peripheral = peripheral;
 
-        if (!sensor.peripheral.connect()) return false;
+        if (!sensor.peripheral.connect()) {
+          if(COMMS) Serial.println("Connection failed, skipping"); 
+          BLE.scan(); 
+          continue;   
+        }
 
-        if (!sensor.peripheral.discoverAttributes()) return false;
+        if (!sensor.peripheral.discoverAttributes()) {
+          if(COMMS) Serial.println("Attribute discovery failed, skipping"); 
+          sensor.peripheral.disconnect(); 
+          BLE.scan(); 
+          continue; 
+        }
 
         sensor.batteryService = sensor.peripheral.service(battServiceUUID);
-        if (!sensor.batteryService) return false;
+        if (!sensor.batteryService) {
+          if(COMMS) Serial.println("Battery service not found, skipping"); 
+          sensor.peripheral.disconnect(); 
+          BLE.scan(); 
+          continue;   
+        }
 
         sensor.batteryChar = sensor.batteryService.characteristic(battCharUUID);
-        if (!sensor.batteryChar || !sensor.batteryChar.canRead()) return false;
+        if (!sensor.batteryChar || !sensor.batteryChar.canRead()) {
+          if(COMMS) Serial.println("Battery characteristic not found, skipping"); 
+          sensor.peripheral.disconnect(); 
+          BLE.scan(); 
+          continue;   
+        }
 
         sensor.ioService = sensor.peripheral.service(AutoIOServiceUUID);
-        if (!sensor.ioService) return false;
+        if (!sensor.ioService) {
+          if(COMMS) Serial.println("IO service not found, skipping"); 
+          sensor.peripheral.disconnect(); 
+          BLE.scan(); 
+          continue;   
+        }
 
         sensor.analogChar = sensor.ioService.characteristic(AnalogCharUUID);
-        if (!sensor.analogChar || !sensor.analogChar.canRead()) return false;
+        if (!sensor.analogChar || !sensor.analogChar.canRead()) {
+          if(COMMS) Serial.println("Analog characteristic not found, skipping"); 
+          sensor.peripheral.disconnect(); 
+          BLE.scan(); 
+          continue;   
+        }
 
         sensor.digitalChar = sensor.ioService.characteristic(DigitalCharUUID);
-        if (!sensor.digitalChar || !sensor.digitalChar.canWrite()) return false;
-
-        if(COMMS) {
-          Serial.print("Sensor ");
-          Serial.print(connectedSensorCount);
-          Serial.print(" connected: ");
-          Serial.println(sensor.peripheral.address());
+        if (!sensor.digitalChar || !sensor.digitalChar.canWrite()) {
+          if(COMMS) Serial.println("Digital characteristic not found, skipping"); 
+          sensor.peripheral.disconnect(); 
+          BLE.scan(); 
+          continue; 
         }
 
         connectedSensorCount++;
