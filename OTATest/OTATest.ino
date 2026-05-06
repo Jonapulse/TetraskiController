@@ -13,17 +13,8 @@ bool OTAUpdateEnable = 0;
 
 
 /************ BLE Sensor Stuff ************************************************/
-//MAC address for TS029 Sensors
-//const char* targetMAC_T2 = "68:23:b0:b6:b3:e9";
-//const char* targetMAC_T3 = "68:23:b0:b6:c8:44";
-
-//MAC address for Ross Test sensors
-// const char* targetMAC_T2 = "68:23:b0:b6:31:61";
-// const char* targetMAC_T3 = "68:23:b0:b7:18:e5";
-
-//MAC address for Jon Test sensors
-const char* targetMAC_T2 = "84:72:93:A5:02:8E";
-const char* targetMAC_T3 = "84:72:93:A5:0B:38";
+const char* targetLocalName  = "ANR Corp M40"; // Match any device with the name for Muscle Sense Model M40
+const int   targetSensorCount = 2;                 // How many sensors to connect to
 
 const char* battServiceUUID   = "180f";
 const char* battCharUUID      = "2A19";
@@ -40,8 +31,8 @@ struct SensorBLE {
   BLECharacteristic digitalChar;
 };
 
-SensorBLE sensorT2;
-SensorBLE sensorT3;
+SensorBLE sensors[2];  // Array to hold connected sensors
+int connectedSensorCount = 0;
 
 #define RECONNECT_FREQ 10000
 
@@ -65,7 +56,6 @@ bool     bufferFilled = false;
 bool     invertDir = false;
 
 
-
 void setup() {
 
   Serial.begin(57600);
@@ -74,33 +64,31 @@ void setup() {
   pinMode(26, OUTPUT);
   digitalWrite(26, HIGH);
 
-
-  BLE.begin();
+  if (!BLE.begin()) {
+    Serial.println("BLE INIT FAILED");
+    while(1);
+  }
 
   // Connect sensors
-  while(1) {    //Enter connection loop
+  while(1) { //Enter connection loop
 
     //attempt to connect again until connection established
-    if(connectSensor(targetMAC_T3, sensorT3) && connectSensor(targetMAC_T2, sensorT2)) {
-      Serial.print('$');  //Send signal to ski signaling successful connection
+    if (connectSensors()) {
+      Serial.print('$');  // Signal successful connection to ski signaling successful connection
       break;
     }
 
     //check for incoming byte from ski to trigger WiFi OTA
     if(Serial.available()) {
       if(Serial.read()=='w') {
-        enterWifiOTA();  //signal from ski to enter wifi OTA
+        enterWifiOTA(); //signal from ski to enter wifi OTA
       }
     }
   }
-  
 
   //perform initial calibration
   calibrateThreshold();
-  
 }
-
-
 
 
 void loop() {
@@ -111,12 +99,10 @@ void loop() {
     //read incoming byte from TetraSki
     char incomingByte = Serial.read();
 
-
     switch(incomingByte) {
-
       //Signal from ski to enter wifi pairing
       case 'w':
-        BLE.stopAdvertise(); // Stop advertising first
+        BLE.stopAdvertise(); //Stop advertising first
         if (BLE.connected()) { //disconnect BLE if connected
           BLE.disconnect();
         }
@@ -130,8 +116,27 @@ void loop() {
         setSensitivity(sensitivityLevels[incomingByte-'0'], sensitivityLevels[incomingByte-'0']);
         if(COMMS) Serial.print("Sensitivity set to");
         if(COMMS) Serial.println(sensitivityLevels[incomingByte-'0']);
+        Serial.print('c'); //send confirmation byte to TetraSki
+        break;
 
-        Serial.print('c');  //send confirmation byte to TetraSki
+      //Signal from ski for inverting direction
+      case '3':
+        direction1 = 1;
+        direction2 = 2;
+        Serial.print('c'); //send confirmation byte to TetraSki
+        break;
+
+      //Signal from ski for inverting direction
+      case '4':
+        direction1 = 2;
+        direction2 = 1;
+        Serial.print('c'); //send confirmation byte to TetraSki
+        break;
+
+      case '5':
+        Serial.print('c'); //send confirmation byte to TetraSki
+        calibrateThreshold();
+        Serial.print('f'); //send confirmation byte to TetraSki
         break;
 
       //FUTURE PER-SENSOR SENSITIVITY CONFIGURATION FOR TETRASKI UI
@@ -145,34 +150,13 @@ void loop() {
       //   Serial.print('c');  //send confirmation byte to TetraSki
       //   break;
 
-      //Signal from ski for inverting direction
-      case '3':
-        direction1 = 1;
-        direction2 = 2;
-        Serial.print('c');  //send confirmation byte to TetraSki
-        break;
-
-      //Signal from ski for inverting direction
-      case '4':
-        direction1 = 2;
-        direction2 = 1; 
-        Serial.print('c');  //send confirmation byte to TetraSki        
-        break;
-
-      //Signal from ski to reinitialize calibration
-      case '5':
-        Serial.print('c');  //send confirmation byte to TetraSki  
-        calibrateThreshold();
-        Serial.print('f');  //send confirmation byte to TetraSki  
-        break;               
     }
   }
-
 
   uint16_t sensorValueT2;
   uint16_t sensorValueT3;
 
-  if (sensorT2.analogChar.readValue(sensorValueT2) && sensorT3.analogChar.readValue(sensorValueT3)) {
+  if (sensors[0].analogChar.readValue(sensorValueT2) && sensors[1].analogChar.readValue(sensorValueT3)) {
 
     //update buffer
     updateBuffer(t2Buffer, sensorValueT2);
@@ -185,42 +169,121 @@ void loop() {
     float slope2 = computeSlope(t2Buffer);
     float slope3 = computeSlope(t3Buffer);
 
-
     //turning logic
     if (sensorValueT2 > t2Threshold && sensorValueT3 < t3Threshold) {
+      Serial.print(direction1);
+    }
+    else if (sensorValueT2 < t2Threshold && sensorValueT3 > t3Threshold) {
+      Serial.print(direction2);
+    }
+    else if (sensorValueT2 > t2Threshold && sensorValueT3 > t3Threshold) {
+      if (slope2 > 0.1 && slope3 < 0.1){
         Serial.print(direction1);
       }
-      else if (sensorValueT2 < t2Threshold && sensorValueT3 > t3Threshold) {
+      else if (slope2 < 0.1 && slope3 > 0.1) {
         Serial.print(direction2);
       }
-      else if (sensorValueT2 > t2Threshold && sensorValueT3 > t3Threshold) {
-        if (slope2 > 0.1 && slope3 < 0.1){
-          Serial.print(direction1);
-        }
-        else if (slope2 < 0.1 && slope3 > 0.1) { 
-          Serial.print(direction2);
-        }
-      }
-      else {
-        Serial.print(idle);
-      }
     }
-
-  
+    else {
+      Serial.print(idle);
+    }
+  }
 }
 
 
+// --------------------------------------------------
+// Connect to N sensors matching target local name
+// --------------------------------------------------
+bool connectSensors() {
+  connectedSensorCount = 0;
+
+  if(COMMS) Serial.println("Scanning for sensors...");
+  BLE.scan();
+
+  long scanStart = millis();
+
+  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
+
+    BLEDevice peripheral = BLE.available();
+
+    if (peripheral) {
+      String name = peripheral.localName();
+      if(COMMS) {
+        Serial.print("Found: ");
+        Serial.print(peripheral.address());
+        Serial.print(" | Name: ");
+        Serial.println(name);
+      }
+
+      if (name == targetLocalName) {
+        if(COMMS) {
+          Serial.print("Target found: ");
+          Serial.println(peripheral.address());
+        }
+
+        BLE.stopScan();
+
+        SensorBLE &sensor = sensors[connectedSensorCount];
+        sensor.peripheral = peripheral;
+
+        if (!sensor.peripheral.connect()) return false;
+
+        if (!sensor.peripheral.discoverAttributes()) return false;
+
+        sensor.batteryService = sensor.peripheral.service(battServiceUUID);
+        if (!sensor.batteryService) return false;
+
+        sensor.batteryChar = sensor.batteryService.characteristic(battCharUUID);
+        if (!sensor.batteryChar || !sensor.batteryChar.canRead()) return false;
+
+        sensor.ioService = sensor.peripheral.service(AutoIOServiceUUID);
+        if (!sensor.ioService) return false;
+
+        sensor.analogChar = sensor.ioService.characteristic(AnalogCharUUID);
+        if (!sensor.analogChar || !sensor.analogChar.canRead()) return false;
+
+        sensor.digitalChar = sensor.ioService.characteristic(DigitalCharUUID);
+        if (!sensor.digitalChar || !sensor.digitalChar.canWrite()) return false;
+
+        if(COMMS) {
+          Serial.print("Sensor ");
+          Serial.print(connectedSensorCount);
+          Serial.print(" connected: ");
+          Serial.println(sensor.peripheral.address());
+        }
+
+        connectedSensorCount++;
+        BLE.scan();  // Resume scanning for next sensor
+      }
+    }
+  }
+
+  BLE.stopScan();
+
+  if (connectedSensorCount == targetSensorCount) {
+    if(COMMS) Serial.println("All sensors connected!");
+    return true;
+  }
+
+  if(COMMS) {
+    Serial.print("Timeout. Connected ");
+    Serial.print(connectedSensorCount);
+    Serial.print(" of ");
+    Serial.println(targetSensorCount);
+  }
+  return false;
+}
 
 
 // --------------------------------------------------
 // Buffer calculation fxns
 // --------------------------------------------------
 void updateBuffer(uint16_t *buffer, uint16_t value) {
-  // Shift left
+  //Shift left
   for (int i = 0; i < BUFFER_SIZE - 1; i++) {
     buffer[i] = buffer[i + 1];
   }
-  // Insert newest at the end
+  //Insert newest at the end
   buffer[BUFFER_SIZE - 1] = value;
 }
 
@@ -234,10 +297,7 @@ float computeAverageDerivative(uint16_t *buffer) {
 
 float computeSlope(uint16_t *buffer) {
   const int N = BUFFER_SIZE;
-  float sumX  = 0;
-  float sumY  = 0;
-  float sumXY = 0;
-  float sumXX = 0;
+  float sumX  = 0, sumY  = 0, sumXY = 0, sumXX = 0;
   for (int i = 0; i < N; i++) {
     sumX  += i;
     sumY  += buffer[i];
@@ -248,50 +308,6 @@ float computeSlope(uint16_t *buffer) {
   if (denominator == 0) return 0;
   return (N * sumXY - sumX * sumY) / denominator;
 }
-
-
-
-
-// --------------------------------------------------
-// Connect + discover sensors
-// --------------------------------------------------
-bool connectSensor(const char* targetMAC, SensorBLE &sensor) {
-  BLE.scan();
-
-  long connectionTimeout=millis();
-  while (millis()-connectionTimeout < RECONNECT_FREQ) {
-    sensor.peripheral = BLE.available();
-
-    if (sensor.peripheral && sensor.peripheral.address() == targetMAC) {
-      BLE.stopScan();
-
-      if (!sensor.peripheral.connect()) return false;
-      if (!sensor.peripheral.discoverAttributes()) return false;
-
-      sensor.batteryService = sensor.peripheral.service(battServiceUUID);
-      if (!sensor.batteryService) return false;
-
-      sensor.batteryChar = sensor.batteryService.characteristic(battCharUUID);
-      if (!sensor.batteryChar || !sensor.batteryChar.canRead()) return false;
-
-      sensor.ioService = sensor.peripheral.service(AutoIOServiceUUID);
-      if (!sensor.ioService) return false;
-
-      sensor.analogChar = sensor.ioService.characteristic(AnalogCharUUID);
-      if (!sensor.analogChar || !sensor.analogChar.canRead()) return false;
-
-      sensor.digitalChar = sensor.ioService.characteristic(DigitalCharUUID);
-      if (!sensor.digitalChar || !sensor.digitalChar.canWrite()) return false;
-
-      Serial.print(sensor.peripheral.address());
-      if(COMMS) Serial.println(" Connected");
-      return true;
-    }
-  }
-  if(COMMS) Serial.println("Connection Timeout");
-  return false;
-}
-
 
 
 // --------------------------------------------------
@@ -311,29 +327,27 @@ void calibrateThreshold() {
   uint8_t orangeLED = 12;
   uint8_t greenLED  = 5;
 
-  sensorT2.digitalChar.writeValue(orangeLED);
-  sensorT3.digitalChar.writeValue(orangeLED);
+  sensors[0].digitalChar.writeValue(orangeLED);
+  sensors[1].digitalChar.writeValue(orangeLED);
 
   if(COMMS) Serial.println("Starting Calibration");
-  
 
-  // Baseline averaging
+  t2Ave = 0;  // Reset averages before accumulating
+  t3Ave = 0;
+
   uint16_t valT2, valT3;
-
   for (int i = 0; i < sizeOfAve; i++) {
-    sensorT2.analogChar.readValue(valT2);
-    sensorT3.analogChar.readValue(valT3);
+    sensors[0].analogChar.readValue(valT2);
+    sensors[1].analogChar.readValue(valT3);
     t2Ave += valT2;
     t3Ave += valT3;
   }
 
-  //set default sensitivity for both sensors
   setSensitivity(sensitivityLevels[0], sensitivityLevels[0]);
 
-  sensorT2.digitalChar.writeValue(greenLED);
-  sensorT3.digitalChar.writeValue(greenLED);
+  sensors[0].digitalChar.writeValue(greenLED);
+  sensors[1].digitalChar.writeValue(greenLED);
 }
-
 
 
 // --------------------------------------------------
@@ -359,12 +373,11 @@ void enterWifiOTA() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
       type = "sketch";
-    } else { // U_SPIFFS
-
-          type = "filesystem";
+    } else { //U_SPIFFS
+      type = "filesystem";
     }
     if(COMMS) Serial.println("Start updating " + type);
-    Serial.print('#'); //Send signal to ski that wifi update is starting
+    Serial.print('#');//Send signal to ski that wifi update is starting
   });
   // ... (other OTA callbacks)
 
@@ -380,5 +393,4 @@ void enterWifiOTA() {
 
   while(1)
     ArduinoOTA.handle();
-
 }
