@@ -45,20 +45,10 @@ int sensorOutputs[4] = {1, 2, 3, 4}; //1 - left, 2 - right, FOR SENSOR_COUNT > 2
 int idle       = 0;
 
 uint16_t sensorAverages[SENSOR_COUNT]; 
-// uint16_t t2Ave = 0;
-// uint16_t t3Ave = 0;
 const int SIZE_OF_AVE = 200;
 
 #define BUFFER_SIZE 20 //data transmission @ 10 Hz for 2 sec
-//TODO: list of buffer pairs
 uint16_t sensorBuffers[SENSOR_COUNT][BUFFER_SIZE];
-// uint16_t t2Buffer[BUFFER_SIZE];
-// uint16_t t3Buffer[BUFFER_SIZE];
-uint16_t bufferIndex  = 0;
-bool     bufferFilled = false;
-//TODO: Make inversion into a list
-bool     invertDir = false; 
-
 
 void setup() {
 
@@ -164,19 +154,12 @@ void loop() {
 
         Serial.print('c');  //send confirmation byte to TetraSki
         break;
-      //TODO: 3 and 4
     }
   }
 
-  //TODO: Make this into a loop
-  
-  
-  // uint16_t sensorValueT2;
-  // uint16_t sensorValueT3;
-
   uint16_t sensorValues[SENSOR_COUNT];
 
-  for(int i = 0; i < SENSOR_COUNT; i += 2)
+  for(int i = 0; i < SENSOR_COUNT; i += 2) //Looping for 2 or 4 sensors
   {
     if (sensors[i].analogChar.readValue(sensorValues[i]) && sensors[i + 1].analogChar.readValue(sensorValues[i + 1])) {
 
@@ -186,7 +169,6 @@ void loop() {
 
       static int fillCount = 0;
       if (fillCount < BUFFER_SIZE) fillCount++;
-      if (fillCount == BUFFER_SIZE) bufferFilled = true;
 
       //calculate changes in signals
       float slopeA = computeSlope(sensorBuffers[i]);
@@ -411,8 +393,8 @@ void calibrateThreshold() {
   sensorAverages[0] = 0;  // Reset averages before accumulating
   sensorAverages[1] = 0;
 #if SENSOR_COUNT == 4
-  sensors[2].digitalChar.writeValue(orangeLED);
-  sensors[3].digitalChar.writeValue(orangeLED);
+  sensorAverages[2] = 0;
+  sensorAverages[3] = 0;
 #endif
 
   uint16_t valT2, valT3, valT4, valT5;
