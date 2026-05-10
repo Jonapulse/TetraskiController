@@ -5,6 +5,7 @@
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
+#define SENSOR_COUNT 2 // Set to 2 or 4 depending on configuration
 
 /************ WiFi OTA Stuff **************************************************/
 const char* ssid = "TetraOTA";
@@ -14,7 +15,6 @@ bool OTAUpdateEnable = 0;
 
 /************ BLE Sensor Stuff ************************************************/
 const char* targetLocalName  = "ANR Corp M40"; // Match any device with the name for Muscle Sense Model M40
-const int   targetSensorCount = 2;                 // How many sensors to connect to
 
 const char* battServiceUUID   = "180f";
 const char* battCharUUID      = "2A19";
@@ -31,29 +31,33 @@ struct SensorBLE {
   BLECharacteristic digitalChar;
 };
 
-SensorBLE sensors[2];  // Array to hold connected sensors
+SensorBLE sensors[SENSOR_COUNT];  // Array to hold connected sensors
 int connectedSensorCount = 0;
 
 #define RECONNECT_FREQ 10000
 
+//Sensitivities
 const uint8_t sensitivityLevels[3] = {20, 50, 80};
-uint16_t t2Threshold = 0;
-uint16_t t3Threshold = 0;
+uint16_t sensorThresholds[SENSOR_COUNT];
 
-int direction1 = 1;
-int direction2 = 2;
+//Directions
+int sensorOutputs[4] = {1, 2, 3, 4}; //1 - left, 2 - right, FOR SENSOR_COUNT > 2 3 - wedge in, 4 - wedge out
 int idle       = 0;
 
-uint16_t t2Ave = 0;
-uint16_t t3Ave = 0;
-const int sizeOfAve = 200;
+uint16_t sensorAverages[SENSOR_COUNT]; 
+// uint16_t t2Ave = 0;
+// uint16_t t3Ave = 0;
+const int SIZE_OF_AVE = 200;
 
 #define BUFFER_SIZE 20 //data transmission @ 10 Hz for 2 sec
-uint16_t t2Buffer[BUFFER_SIZE];
-uint16_t t3Buffer[BUFFER_SIZE];
+//TODO: list of buffer pairs
+uint16_t sensorBuffers[SENSOR_COUNT][BUFFER_SIZE];
+// uint16_t t2Buffer[BUFFER_SIZE];
+// uint16_t t3Buffer[BUFFER_SIZE];
 uint16_t bufferIndex  = 0;
 bool     bufferFilled = false;
-bool     invertDir = false;
+//TODO: Make inversion into a list
+bool     invertDir = false; 
 
 
 void setup() {
@@ -114,29 +118,28 @@ void loop() {
       case '0':
       case '1':
       case '2':
-        //setBothSensitivitiesSensitivity(sensitivityLevels[incomingByte-'0'], sensitivityLevels[incomingByte-'0']);
         setSensitivityBySensor(0, sensitivityLevels[incomingByte-'0']);
         if(COMMS){
           Serial.println();
           Serial.print("\nSensitivity for sensor 0 set to ");
           Serial.print(sensitivityLevels[incomingByte-'0']);
           Serial.print(" with a threshold of ");
-          Serial.println(t2Threshold);
+          Serial.println(sensorThresholds[0]);
         }
         Serial.print('c'); //send confirmation byte to TetraSki
         break;
 
       //Signal from ski for inverting direction
       case '3':
-        direction1 = 1;
-        direction2 = 2;
+        sensorOutputs[0] = 1; // 1 - left
+        sensorOutputs[1] = 2; // 2 - right
         Serial.print('c'); //send confirmation byte to TetraSki
         break;
 
       //Signal from ski for inverting direction
       case '4':
-        direction1 = 2;
-        direction2 = 1;
+        sensorOutputs[0] = 2; // 2 - right
+        sensorOutputs[1] = 1; // 1 - left
         Serial.print('c'); //send confirmation byte to TetraSki
         break;
 
@@ -146,7 +149,7 @@ void loop() {
         Serial.print('f'); //send confirmation byte to TetraSki
         break;
 
-      //Signal from ski to change sensitivity for  (*currently preset levels) for sensor 1 (2nd sensor)
+      //Signal from ski to change sensitivity for  (*currently preset levels) for sensor[1]
       case '6':
       case '7':
       case '8':
@@ -156,50 +159,63 @@ void loop() {
           Serial.print("\nSensitivity for sensor 1 set to ");
           Serial.print(sensitivityLevels[incomingByte-'6']);
           Serial.print(" with a threshold of ");
-          Serial.println(t3Threshold);
+          Serial.println(sensorThresholds[1]);
         }
 
         Serial.print('c');  //send confirmation byte to TetraSki
         break;
-
+      //TODO: 3 and 4
     }
   }
 
-  uint16_t sensorValueT2;
-  uint16_t sensorValueT3;
+  //TODO: Make this into a loop
+  
+  
+  // uint16_t sensorValueT2;
+  // uint16_t sensorValueT3;
 
-  if (sensors[0].analogChar.readValue(sensorValueT2) && sensors[1].analogChar.readValue(sensorValueT3)) {
+  uint16_t sensorValues[SENSOR_COUNT];
 
-    //update buffer
-    updateBuffer(t2Buffer, sensorValueT2);
-    updateBuffer(t3Buffer, sensorValueT3);
-    static int fillCount = 0;
-    if (fillCount < BUFFER_SIZE) fillCount++;
-    if (fillCount == BUFFER_SIZE) bufferFilled = true;
+  for(int i = 0; i < SENSOR_COUNT; i += 2)
+  {
+    if (sensors[i].analogChar.readValue(sensorValues[i]) && sensors[i + 1].analogChar.readValue(sensorValues[i + 1])) {
 
-    //calculate changes in signals
-    float slope2 = computeSlope(t2Buffer);
-    float slope3 = computeSlope(t3Buffer);
+      //update buffer
+      updateBuffer(sensorBuffers[i], sensorValues[i]);
+      updateBuffer(sensorBuffers[i + 1], sensorValues[i + 1]);
 
-    //turning logic
-    if (sensorValueT2 > t2Threshold && sensorValueT3 < t3Threshold) {
-      Serial.print(direction1);
-    }
-    else if (sensorValueT2 < t2Threshold && sensorValueT3 > t3Threshold) {
-      Serial.print(direction2);
-    }
-    else if (sensorValueT2 > t2Threshold && sensorValueT3 > t3Threshold) {
-      if (slope2 > 0.1 && slope3 < 0.1){
-        Serial.print(direction1);
+      static int fillCount = 0;
+      if (fillCount < BUFFER_SIZE) fillCount++;
+      if (fillCount == BUFFER_SIZE) bufferFilled = true;
+
+      //calculate changes in signals
+      float slopeA = computeSlope(sensorBuffers[i]);
+      float slopeB = computeSlope(sensorBuffers[i + 1]);
+
+      bool sensATriggered = sensorValues[i] > sensorThresholds[i];
+      bool sensBTriggered = sensorValues[i + 1] > sensorThresholds[i + 1];
+
+      //turning logic
+      if (sensATriggered && !sensBTriggered) {
+        Serial.print(sensorOutputs[i]);
       }
-      else if (slope2 < 0.1 && slope3 > 0.1) {
-        Serial.print(direction2);
+      else if (!sensATriggered && sensBTriggered) {
+        Serial.print(sensorOutputs[i + 1]);
       }
-    }
-    else {
-      Serial.print(idle);
+      else if (sensATriggered && sensBTriggered) {
+        if (slopeA > 0.1 && slopeB < 0.1){
+          Serial.print(sensorOutputs[i]);
+        }
+        else if (slopeA < 0.1 && slopeB > 0.1) {
+          Serial.print(sensorOutputs[i + 1]);
+        }
+      }
+      else {
+        Serial.print(idle);
+      }
     }
   }
+  
 }
 
 
@@ -214,7 +230,7 @@ bool connectSensors() {
 
   long scanStart = millis();
 
-  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
+  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < SENSOR_COUNT) {
 
     BLEDevice peripheral = BLE.available();
 
@@ -299,7 +315,8 @@ bool connectSensors() {
 
   BLE.stopScan();
 
-  if (connectedSensorCount == targetSensorCount) {
+  if (connectedSensorCount == SENSOR_COUNT) {
+    sortSensors(); 
     if(COMMS) Serial.println("All sensors connected!");
     return true;
   }
@@ -308,11 +325,28 @@ bool connectSensors() {
     Serial.print("Timeout. Connected ");
     Serial.print(connectedSensorCount);
     Serial.print(" of ");
-    Serial.println(targetSensorCount);
+    Serial.println(SENSOR_COUNT);
   }
   return false;
 }
 
+// --------------------------------------------------
+// Sort Sensors - ensures Muscle Sensors detected in 
+// arbitrary order will maintain "identity" on reset, so
+// 'turn left' is not reassigned on reset (unless sensors change)
+// --------------------------------------------------
+void sortSensors()
+{
+  for (int i = 0; i < SENSOR_COUNT - 1; i++) {
+    for (int j = i + 1; j < SENSOR_COUNT; j++) {
+      if (String(sensors[i].peripheral.address()) > String(sensors[j].peripheral.address())) {
+          SensorBLE temp = sensors[i];
+          sensors[i] = sensors[j];
+          sensors[j] = temp;
+      }
+    }
+  }
+}
 
 // --------------------------------------------------
 // Buffer calculation fxns
@@ -348,30 +382,14 @@ float computeSlope(uint16_t *buffer) {
   return (N * sumXY - sumX * sumY) / denominator;
 }
 
-
-// --------------------------------------------------
-// Set Sensitivity for both sensors
-// --------------------------------------------------
-void setBothSensitivities(uint16_t t2value, uint16_t t3value) {
-  t2Threshold = (t2Ave / sizeOfAve) + t2value;
-  t3Threshold = (t3Ave / sizeOfAve) + t3value;
-}
-
+//TODO: Update to individual thresholds
 // --------------------------------------------------
 // Set Sensitivity by sensor
 // --------------------------------------------------
 void setSensitivityBySensor(uint16_t sensor, uint16_t value)
 {
-  switch(sensor){
-    case(0):
-      t2Threshold = (t2Ave / sizeOfAve) + value;
-      break;
-    case(1):
-      t3Threshold = (t3Ave / sizeOfAve) + value;
-      break;
-  }
+  sensorThresholds[sensor] = (sensorAverages[sensor] / SIZE_OF_AVE) + value;
 }
-
 
 // --------------------------------------------------
 // Calibrate sensors to baseline
@@ -383,24 +401,44 @@ void calibrateThreshold() {
 
   sensors[0].digitalChar.writeValue(orangeLED);
   sensors[1].digitalChar.writeValue(orangeLED);
+#if SENSOR_COUNT == 4
+  sensors[2].digitalChar.writeValue(orangeLED);
+  sensors[3].digitalChar.writeValue(orangeLED);
+#endif
 
   if(COMMS) Serial.println("Starting Calibration");
 
-  t2Ave = 0;  // Reset averages before accumulating
-  t3Ave = 0;
+  sensorAverages[0] = 0;  // Reset averages before accumulating
+  sensorAverages[1] = 0;
+#if SENSOR_COUNT == 4
+  sensors[2].digitalChar.writeValue(orangeLED);
+  sensors[3].digitalChar.writeValue(orangeLED);
+#endif
 
-  uint16_t valT2, valT3;
-  for (int i = 0; i < sizeOfAve; i++) {
+  uint16_t valT2, valT3, valT4, valT5;
+  for (int i = 0; i < SIZE_OF_AVE; i++) {
     sensors[0].analogChar.readValue(valT2);
     sensors[1].analogChar.readValue(valT3);
-    t2Ave += valT2;
-    t3Ave += valT3;
+    sensorAverages[0] += valT2;
+    sensorAverages[1] += valT3;
+#if SENSOR_COUNT == 4
+    sensors[2].analogChar.readValue(valT4);
+    sensors[3].analogChar.readValue(valT5);
+    sensorAverages[2] += valT4;
+    sensorAverages[3] += valT5;
+#endif
   }
 
-  setBothSensitivities(sensitivityLevels[1], sensitivityLevels[1]);
-
+  setSensitivityBySensor(0, sensitivityLevels[1]);
+  setSensitivityBySensor(1, sensitivityLevels[1]);
   sensors[0].digitalChar.writeValue(greenLED);
   sensors[1].digitalChar.writeValue(greenLED);
+#if SENSOR_COUNT == 4
+  setSensitivityBySensor(2, sensitivityLevels[1]);
+  setSensitivityBySensor(3, sensitivityLevels[1]);
+  sensors[2].digitalChar.writeValue(greenLED);
+  sensors[3].digitalChar.writeValue(greenLED);
+#endif
 }
 
 
