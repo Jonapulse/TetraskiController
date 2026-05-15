@@ -5,7 +5,7 @@
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
-#define SENSOR_COUNT 2 // Set to 2 or 4 depending on configuration
+#define SENSOR_COUNT 4 // Set to 2 or 4 depending on configuration
 
 /************ WiFi OTA Stuff **************************************************/
 const char* ssid = "TetraOTA";
@@ -86,6 +86,16 @@ void setup() {
 }
 
 
+
+// --------------------------------------------------
+// loop - 
+// read/respond to serial input
+// 'w' - enter wifi pairing
+// '5' - calibrate sensors
+// 'c'/'f' - confirmation bytes for control change and calibration
+// '0,1,2'/'6,7,8'/'i,j,k'/'l,m,n' - sensitivity for sensors 0,1,2,3 
+// '3,4'/'g,h' - set 'left/right' sensors to standard or inverted controls
+// --------------------------------------------------
 void loop() {
 
   //check for incoming comms from TetraSki
@@ -119,14 +129,14 @@ void loop() {
         Serial.print('c'); //send confirmation byte to TetraSki
         break;
 
-      //Signal from ski for inverting direction
+      //Signal from ski for standard direction controls
       case '3':
         sensorOutputs[0] = 1; // 1 - left
         sensorOutputs[1] = 2; // 2 - right
         Serial.print('c'); //send confirmation byte to TetraSki
         break;
 
-      //Signal from ski for inverting direction
+      //Signal from ski for inverted direction controls
       case '4':
         sensorOutputs[0] = 2; // 2 - right
         sensorOutputs[1] = 1; // 1 - left
@@ -154,6 +164,54 @@ void loop() {
 
         Serial.print('c');  //send confirmation byte to TetraSki
         break;
+
+#if SENSOR_COUNT == 4
+      //Signal from ski for standard wedge direction controls
+      case 'g':
+        sensorOutputs[2] = 3; // 3 - wedge in
+        sensorOutputs[3] = 4; // 4 - wedge out
+        Serial.print('c'); //send confirmation byte to TetraSki
+        break;
+
+      //Signal from ski for inverted wedge direction controls
+      case 'h':
+        sensorOutputs[2] = 4; // 4 - wedge in
+        sensorOutputs[3] = 3; // 3 - wedge out
+        Serial.print('c'); //send confirmation byte to TetraSki
+        break;
+
+      //Signal from ski to change sensitivity for  (*currently preset levels) for sensor[2]
+      case 'i':
+      case 'j':
+      case 'k':
+        setSensitivityBySensor(2, sensitivityLevels[incomingByte-'i']);
+        if(COMMS){
+          Serial.println();
+          Serial.print("\nSensitivity for sensor 2 set to ");
+          Serial.print(sensitivityLevels[incomingByte-'i']);
+          Serial.print(" with a threshold of ");
+          Serial.println(sensorThresholds[2]);
+        }
+
+        Serial.print('c');  //send confirmation byte to TetraSki
+        break;
+
+        //Signal from ski to change sensitivity for  (*currently preset levels) for sensor[2]
+      case 'l':
+      case 'm':
+      case 'n':
+        setSensitivityBySensor(3, sensitivityLevels[incomingByte-'l']);
+        if(COMMS){
+          Serial.println();
+          Serial.print("\nSensitivity for sensor 3 set to ");
+          Serial.print(sensitivityLevels[incomingByte-'l']);
+          Serial.print(" with a threshold of ");
+          Serial.println(sensorThresholds[3]);
+        }
+
+        Serial.print('c');  //send confirmation byte to TetraSki
+        break;
+#endif
     }
   }
 
