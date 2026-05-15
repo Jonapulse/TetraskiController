@@ -1,11 +1,11 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
-#include <ArduinoBLE.h>
+#include "NimBLEDevice.h" //CHANGE: replaced ArduinoBLE.h with NimBLEDevice.h
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
-#define SENSOR_COUNT 4 // Set to 2 or 4 depending on configuration
+#define SENSOR_COUNT 2 // Set to 2 or 4 depending on configuration
 
 /************ WiFi OTA Stuff **************************************************/
 const char* ssid = "TetraOTA";
@@ -22,13 +22,14 @@ const char* AutoIOServiceUUID = "1815";
 const char* AnalogCharUUID    = "2A58";
 const char* DigitalCharUUID   = "2A56";
 
+//CHANGE: SensorBLE struct updated to use NimBLE pointer types
 struct SensorBLE {
-  BLEDevice peripheral;
-  BLEService batteryService;
-  BLEService ioService;
-  BLECharacteristic batteryChar;
-  BLECharacteristic analogChar;
-  BLECharacteristic digitalChar;
+  NimBLEClient*               client         = nullptr;
+  NimBLERemoteService*        batteryService = nullptr;
+  NimBLERemoteService*        ioService      = nullptr;
+  NimBLERemoteCharacteristic* batteryChar    = nullptr;
+  NimBLERemoteCharacteristic* analogChar     = nullptr;
+  NimBLERemoteCharacteristic* digitalChar    = nullptr;
 };
 
 SensorBLE sensors[SENSOR_COUNT];  // Array to hold connected sensors
@@ -58,11 +59,9 @@ void setup() {
   pinMode(26, OUTPUT);
   digitalWrite(26, HIGH);
 
-  if (!BLE.begin()) {
-    //NOTE: esp32 3.3.7 breaks BLE. 3.3.6 by Espressif works - as of 2/18/26
-    Serial.println("BLE INIT FAILED");
-    while(1);
-  }
+  //CHANGE: replaced BLE.begin() with NimBLEDevice::init()
+  //NOTE: esp32 3.3.7 breaks ArduinoBLE. NimBLE does not have this issue.
+  NimBLEDevice::init("");
 
   // Connect sensors
   while(1) { //Enter connection loop
@@ -107,10 +106,13 @@ void loop() {
     switch(incomingByte) {
       //Signal from ski to enter wifi pairing
       case 'w':
-        BLE.stopAdvertise(); //Stop advertising first
-        if (BLE.connected()) { //disconnect BLE if connected
-          BLE.disconnect();
+        //CHANGE: replaced BLE.stopAdvertise()/BLE.connected()/BLE.disconnect() with NimBLE client disconnects and deinit
+        for (int i = 0; i < SENSOR_COUNT; i++) {
+          if (sensors[i].client && sensors[i].client->isConnected()) {
+            sensors[i].client->disconnect();
+          }
         }
+        NimBLEDevice::deinit(true);
         delay(1000); //delay to allow disconnect
         enterWifiOTA();
 
@@ -196,7 +198,7 @@ void loop() {
         Serial.print('c');  //send confirmation byte to TetraSki
         break;
 
-        //Signal from ski to change sensitivity for  (*currently preset levels) for sensor[2]
+      //Signal from ski to change sensitivity for  (*currently preset levels) for sensor[3]
       case 'l':
       case 'm':
       case 'n':
@@ -219,7 +221,13 @@ void loop() {
 
   for(int i = 0; i < SENSOR_COUNT; i += 2) //Looping for 2 or 4 sensors
   {
-    if (sensors[i].analogChar.readValue(sensorValues[i]) && sensors[i + 1].analogChar.readValue(sensorValues[i + 1])) {
+    //CHANGE: replaced analogChar.readValue() with NimBLE readValue() returning std::string, cast to uint16_t
+    std::string rawA = sensors[i].analogChar->readValue();
+    std::string rawB = sensors[i + 1].analogChar->readValue();
+
+    if (rawA.length() >= 2 && rawB.length() >= 2) {
+      sensorValues[i]     = *(uint16_t*)rawA.data();
+      sensorValues[i + 1] = *(uint16_t*)rawB.data();
 
       //update buffer
       updateBuffer(sensorBuffers[i], sensorValues[i]);
@@ -262,101 +270,105 @@ void loop() {
 // --------------------------------------------------
 // Connect to N sensors matching target local name
 // --------------------------------------------------
+//CHANGE: connectSensors rewritten to use NimBLE scanning and client API
 bool connectSensors() {
   connectedSensorCount = 0;
 
   if(COMMS) Serial.println("Scanning for sensors...");
-  BLE.scan();
+
+  NimBLEScan* pScan = NimBLEDevice::getScan(); //CHANGE: get NimBLE scan instance
+  pScan->setActiveScan(true); //CHANGE: active scan returns more device info including name
 
   long scanStart = millis();
 
   while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < SENSOR_COUNT) {
 
-    BLEDevice peripheral = BLE.available();
+    //CHANGE: blocking scan for 1 second per iteration, then check results
+    NimBLEScanResults results = pScan->getResults(1000, false);
 
-    if (peripheral) {
-      String name = peripheral.localName();
+    for (int i = 0; i < results.getCount(); i++) {
+      const NimBLEAdvertisedDevice* device = results.getDevice(i);
+      std::string name = device->getName();
+
       if(COMMS) {
         Serial.print("Found: ");
-        Serial.print(peripheral.address());
+        Serial.print(device->getAddress().toString().c_str());
         Serial.print(" | Name: ");
-        Serial.println(name);
+        Serial.println(name.c_str());
       }
 
       if (name == targetLocalName) {
         if(COMMS) {
           Serial.print("Target found: ");
-          Serial.println(peripheral.address());
+          Serial.println(device->getAddress().toString().c_str());
         }
-
-        BLE.stopScan();
 
         SensorBLE &sensor = sensors[connectedSensorCount];
-        sensor.peripheral = peripheral;
 
-        if (!sensor.peripheral.connect()) {
-          if(COMMS) Serial.println("Connection failed, skipping"); 
-          BLE.scan(); 
-          continue;   
+        sensor.client = NimBLEDevice::createClient(); //CHANGE: create NimBLE client
+        if (!sensor.client) {
+          if(COMMS) Serial.println("Client creation failed, skipping");
+          continue;
         }
 
-        if (!sensor.peripheral.discoverAttributes()) {
-          if(COMMS) Serial.println("Attribute discovery failed, skipping"); 
-          sensor.peripheral.disconnect(); 
-          BLE.scan(); 
-          continue; 
+        if (!sensor.client->connect(device)) {
+          if(COMMS) Serial.println("Connection failed, skipping");
+          NimBLEDevice::deleteClient(sensor.client); //CHANGE: clean up failed client
+          sensor.client = nullptr;
+          continue;
         }
 
-        sensor.batteryService = sensor.peripheral.service(battServiceUUID);
+        //CHANGE: NimBLE discovers attributes automatically on connect, no separate call needed
+
+        sensor.batteryService = sensor.client->getService(battServiceUUID); //CHANGE: getService replaces peripheral.service()
         if (!sensor.batteryService) {
-          if(COMMS) Serial.println("Battery service not found, skipping"); 
-          sensor.peripheral.disconnect(); 
-          BLE.scan(); 
-          continue;   
+          if(COMMS) Serial.println("Battery service not found, skipping");
+          sensor.client->disconnect();
+          continue;
         }
 
-        sensor.batteryChar = sensor.batteryService.characteristic(battCharUUID);
-        if (!sensor.batteryChar || !sensor.batteryChar.canRead()) {
-          if(COMMS) Serial.println("Battery characteristic not found, skipping"); 
-          sensor.peripheral.disconnect(); 
-          BLE.scan(); 
-          continue;   
+        sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID); //CHANGE: getCharacteristic replaces .characteristic()
+        if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
+          if(COMMS) Serial.println("Battery characteristic not found, skipping");
+          sensor.client->disconnect();
+          continue;
         }
 
-        sensor.ioService = sensor.peripheral.service(AutoIOServiceUUID);
+        sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
         if (!sensor.ioService) {
-          if(COMMS) Serial.println("IO service not found, skipping"); 
-          sensor.peripheral.disconnect(); 
-          BLE.scan(); 
-          continue;   
+          if(COMMS) Serial.println("IO service not found, skipping");
+          sensor.client->disconnect();
+          continue;
         }
 
-        sensor.analogChar = sensor.ioService.characteristic(AnalogCharUUID);
-        if (!sensor.analogChar || !sensor.analogChar.canRead()) {
-          if(COMMS) Serial.println("Analog characteristic not found, skipping"); 
-          sensor.peripheral.disconnect(); 
-          BLE.scan(); 
-          continue;   
+        sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
+        if (!sensor.analogChar || !sensor.analogChar->canRead()) {
+          if(COMMS) Serial.println("Analog characteristic not found, skipping");
+          sensor.client->disconnect();
+          continue;
         }
 
-        sensor.digitalChar = sensor.ioService.characteristic(DigitalCharUUID);
-        if (!sensor.digitalChar || !sensor.digitalChar.canWrite()) {
-          if(COMMS) Serial.println("Digital characteristic not found, skipping"); 
-          sensor.peripheral.disconnect(); 
-          BLE.scan(); 
-          continue; 
+        sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
+        if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
+          if(COMMS) Serial.println("Digital characteristic not found, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        if(COMMS) {
+          Serial.print("Sensor ");
+          Serial.print(connectedSensorCount);
+          Serial.print(" connected: ");
+          Serial.println(device->getAddress().toString().c_str());
         }
 
         connectedSensorCount++;
-        BLE.scan();  // Resume scanning for next sensor
       }
     }
   }
 
-  BLE.stopScan();
-
   if (connectedSensorCount == SENSOR_COUNT) {
-    sortSensors(); 
+    sortSensors();
     if(COMMS) Serial.println("All sensors connected!");
     return true;
   }
@@ -375,11 +387,13 @@ bool connectSensors() {
 // arbitrary order will maintain "identity" on reset, so
 // 'turn left' is not reassigned on reset (unless sensors change)
 // --------------------------------------------------
+//CHANGE: sortSensors updated to use NimBLE address API
 void sortSensors()
 {
   for (int i = 0; i < SENSOR_COUNT - 1; i++) {
     for (int j = i + 1; j < SENSOR_COUNT; j++) {
-      if (String(sensors[i].peripheral.address()) > String(sensors[j].peripheral.address())) {
+      if (String(sensors[i].client->getPeerAddress().toString().c_str()) >
+          String(sensors[j].client->getPeerAddress().toString().c_str())) {
           SensorBLE temp = sensors[i];
           sensors[i] = sensors[j];
           sensors[j] = temp;
@@ -434,16 +448,17 @@ void setSensitivityBySensor(uint16_t sensor, uint16_t value)
 // --------------------------------------------------
 // Calibrate sensors to baseline
 // --------------------------------------------------
+//CHANGE: writeValue() and readValue() updated to NimBLE API throughout
 void calibrateThreshold() {
 
   uint8_t orangeLED = 12;
   uint8_t greenLED  = 5;
 
-  sensors[0].digitalChar.writeValue(orangeLED);
-  sensors[1].digitalChar.writeValue(orangeLED);
+  sensors[0].digitalChar->writeValue(&orangeLED, 1); //CHANGE: NimBLE writeValue takes pointer and length
+  sensors[1].digitalChar->writeValue(&orangeLED, 1);
 #if SENSOR_COUNT == 4
-  sensors[2].digitalChar.writeValue(orangeLED);
-  sensors[3].digitalChar.writeValue(orangeLED);
+  sensors[2].digitalChar->writeValue(&orangeLED, 1);
+  sensors[3].digitalChar->writeValue(&orangeLED, 1);
 #endif
 
   if(COMMS) Serial.println("Starting Calibration");
@@ -455,29 +470,29 @@ void calibrateThreshold() {
   sensorAverages[3] = 0;
 #endif
 
-  uint16_t valT2, valT3, valT4, valT5;
+  //CHANGE: readValue() returns std::string, cast raw bytes to uint16_t
   for (int i = 0; i < SIZE_OF_AVE; i++) {
-    sensors[0].analogChar.readValue(valT2);
-    sensors[1].analogChar.readValue(valT3);
-    sensorAverages[0] += valT2;
-    sensorAverages[1] += valT3;
+    std::string v0 = sensors[0].analogChar->readValue();
+    std::string v1 = sensors[1].analogChar->readValue();
+    if (v0.length() >= 2) sensorAverages[0] += *(uint16_t*)v0.data();
+    if (v1.length() >= 2) sensorAverages[1] += *(uint16_t*)v1.data();
 #if SENSOR_COUNT == 4
-    sensors[2].analogChar.readValue(valT4);
-    sensors[3].analogChar.readValue(valT5);
-    sensorAverages[2] += valT4;
-    sensorAverages[3] += valT5;
+    std::string v2 = sensors[2].analogChar->readValue();
+    std::string v3 = sensors[3].analogChar->readValue();
+    if (v2.length() >= 2) sensorAverages[2] += *(uint16_t*)v2.data();
+    if (v3.length() >= 2) sensorAverages[3] += *(uint16_t*)v3.data();
 #endif
   }
 
   setSensitivityBySensor(0, sensitivityLevels[1]);
   setSensitivityBySensor(1, sensitivityLevels[1]);
-  sensors[0].digitalChar.writeValue(greenLED);
-  sensors[1].digitalChar.writeValue(greenLED);
+  sensors[0].digitalChar->writeValue(&greenLED, 1); //CHANGE: NimBLE writeValue takes pointer and length
+  sensors[1].digitalChar->writeValue(&greenLED, 1);
 #if SENSOR_COUNT == 4
   setSensitivityBySensor(2, sensitivityLevels[1]);
   setSensitivityBySensor(3, sensitivityLevels[1]);
-  sensors[2].digitalChar.writeValue(greenLED);
-  sensors[3].digitalChar.writeValue(greenLED);
+  sensors[2].digitalChar->writeValue(&greenLED, 1);
+  sensors[3].digitalChar->writeValue(&greenLED, 1);
 #endif
 }
 
@@ -487,7 +502,7 @@ void calibrateThreshold() {
 // --------------------------------------------------
 void enterWifiOTA() {
 
-  BLE.end();
+  NimBLEDevice::deinit(true); //CHANGE: replaced BLE.end() with NimBLEDevice::deinit()
   delay(1000);
 
   if(COMMS) Serial.println("Entering WiFi OTA");
