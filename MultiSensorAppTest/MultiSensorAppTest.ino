@@ -5,7 +5,8 @@
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
-#define SENSOR_COUNT 4  // Set to 2 or 4 depending on configuration
+#define DEFAULT_SENSOR_COUNT 4  
+#define MAX_SENSOR_COUNT 4
 
 /************ WiFi OTA Stuff **************************************************/
 const char* ssid = "TetraOTA";
@@ -31,27 +32,28 @@ struct SensorBLE {
   NimBLERemoteCharacteristic* digitalChar = nullptr;
 };
 
-SensorBLE sensors[SENSOR_COUNT];
+SensorBLE sensors[MAX_SENSOR_COUNT];
+int targetSensorCount = MAX_SENSOR_COUNT;
 int connectedSensorCount = 0;
 
-volatile uint16_t latestAnalogValues[SENSOR_COUNT] = { 0 };
-volatile bool newValueReady[SENSOR_COUNT] = { false };
+volatile uint16_t latestAnalogValues[MAX_SENSOR_COUNT] = { 0 };
+volatile bool newValueReady[MAX_SENSOR_COUNT] = { false };
 
 #define RECONNECT_FREQ 10000
 
 //Sensitivities
 const uint8_t sensitivityLevels[3] = { 20, 50, 80 };
-uint16_t sensorThresholds[SENSOR_COUNT];
+uint16_t sensorThresholds[MAX_SENSOR_COUNT];
 
 //Directions
-int sensorOutputs[4] = { 1, 2, 3, 4 };  //1 - left, 2 - right, FOR SENSOR_COUNT > 2: 3 - wedge in, 4 - wedge out
+int sensorOutputs[MAX_SENSOR_COUNT] = { 1, 2, 3, 4 };  //1 - left, 2 - right, FOR targetSensorCount > 2: 3 - wedge in, 4 - wedge out
 int idle = 0;
 
-uint16_t sensorAverages[SENSOR_COUNT];
+uint16_t sensorAverages[MAX_SENSOR_COUNT];
 const int SIZE_OF_AVE = 200;
 
 #define BUFFER_SIZE 20  //data transmission @ 10 Hz for 2 sec
-uint16_t sensorBuffers[SENSOR_COUNT][BUFFER_SIZE];
+uint16_t sensorBuffers[MAX_SENSOR_COUNT][BUFFER_SIZE];
 
 
 // --------------------------------------------------
@@ -102,10 +104,7 @@ NotifyCallback notifyCallbacks[4] = {
 };
 
 
-//CHANGE
-/************ BLE Phone Peripheral Stuff **************************************/
-// NimBLE peripheral objects for advertising TetraRadio to the phone.
-// Replaces ArduinoBLE BLEService / BLECharacteristic declarations.
+/************ NimBLE Phone Peripheral Stuff **************************************/
 
 // UUIDs must match App.js constants exactly
 #define PHONE_SERVICE_UUID      "12345678-1234-1234-1234-123456789abc"
@@ -119,19 +118,16 @@ NimBLECharacteristic* pBatteryDataChar   = nullptr;  // READ    — 2 bytes: [ba
 NimBLECharacteristic* pCommandChar       = nullptr;  // WRITE   — 1 byte command
 bool phoneConnected = false;
 
-//CHANGE
 // Forward declaration — handleCommand() is used inside CommandCallbacks::onWrite()
-// which is defined before the function body appears later in the file
 void handleCommand(char cmd);
 
-//CHANGE
 // NimBLE server callbacks — track phone connect/disconnect
 class PhoneServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  //CHANGE: newer NimBLE adds connInfo parameter
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  
     phoneConnected = true;
     if (COMMS) Serial.println("Phone connected");
   }
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {  //CHANGE: newer NimBLE adds connInfo + reason parameters
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override { 
     phoneConnected = false;
     if (COMMS) Serial.println("Phone disconnected — restarting advertising");
     NimBLEDevice::startAdvertising();  // auto-restart so phone can reconnect
@@ -142,16 +138,12 @@ class PhoneServerCallbacks : public NimBLEServerCallbacks {
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {  
     std::string val = pChar->getValue();
-    //TODO: check to see if this just gets whatevers printing. I might not need to pare it down to a char
     if (val.length() > 0) {
       handleCommand((char)val[0]);
     }
   }
 };
 
-//CHANGE
-// Set up NimBLE peripheral (phone-facing) service and characteristics.
-// Called once from setup() after NimBLEDevice::init().
 void setupPhonePeripheral() {
   pPhoneServer = NimBLEDevice::createServer();
   pPhoneServer->setCallbacks(new PhoneServerCallbacks());
@@ -199,9 +191,9 @@ void setup() {
 
   NimBLEDevice::init("TetraRadio");
 
-  //CHANGE
-  // Start advertising to phone before scanning for sensors,
-  // so the phone can see TetraRadio while sensor connection is in progress.
+  //TODO: Check fors saved data, including sensor count
+  targetSensorCount = 2;
+
   setupPhonePeripheral();
 
   // Connect sensors
@@ -241,14 +233,14 @@ void loop() {
   //check for incoming comms from TetraSki
   if (Serial.available()) {
     char incomingByte = Serial.read();
-    handleCommand(incomingByte);  //CHANGE: delegate to shared handler
+    handleCommand(incomingByte); 
   }
 
-  for (int i = 0; i < SENSOR_COUNT; i += 2) {
+  for (int i = 0; i < targetSensorCount; i += 2) {
     if (newValueReady[i] && newValueReady[i + 1]) {
       uint16_t valA = latestAnalogValues[i];
       uint16_t valB = latestAnalogValues[i + 1];
-      newValueReady[i] = false;  //CHANGE: clear flags after reading
+      newValueReady[i] = false;  
       newValueReady[i + 1] = false;
 
       //update buffer
@@ -282,7 +274,6 @@ void loop() {
       //output direction over serial to TetraSki
       Serial.print(currentDirection);
 
-      //CHANGE
       // Broadcast sensor data to phone if connected.
       // Only broadcasting the first pair (sensors 0+1) for now —
       // expand payload if the app is updated to display all 4 sensors.
@@ -317,14 +308,14 @@ void loop() {
 // --------------------------------------------------
 // Shared command handler (serial + BLE phone)
 // --------------------------------------------------
-//CHANGE
+// TODO: Update loop so it can handle multi-char
 // Handles commands from both serial (TetraSki) and BLE phone writes.
 // Extracted so CommandCallbacks::onWrite() and loop() share one implementation.
 void handleCommand(char cmd) {
   switch (cmd) {
 
     case 'w':
-      for (int i = 0; i < SENSOR_COUNT; i++) {
+      for (int i = 0; i < targetSensorCount; i++) {
         if (sensors[i].client && sensors[i].client->isConnected()) {
           sensors[i].client->disconnect();
         }
@@ -374,7 +365,6 @@ void handleCommand(char cmd) {
       Serial.print('c');
       break;
 
-#if SENSOR_COUNT == 4
     case 'g':
       sensorOutputs[2] = 3;
       sensorOutputs[3] = 4;
@@ -408,7 +398,6 @@ void handleCommand(char cmd) {
       }
       Serial.print('c');
       break;
-#endif
   }
 }
 
@@ -426,7 +415,7 @@ bool connectSensors() {
 
   long scanStart = millis();
 
-  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < SENSOR_COUNT) {
+  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
 
     NimBLEScanResults results = pScan->getResults(1000, false);
 
@@ -497,8 +486,7 @@ bool connectSensors() {
           continue;
         }
 
-        //CHANGE: subscribe to analog characteristic notifications
-        //        notifyCallbacks[] maps sensor index to its callback function
+        // notifyCallbacks[] maps sensor index to its callback function
         if (!sensor.analogChar->subscribe(true, notifyCallbacks[connectedSensorCount])) {
           if (COMMS) Serial.println("Notification subscription failed, skipping");
           sensor.client->disconnect();
@@ -517,7 +505,7 @@ bool connectSensors() {
     }
   }
 
-  if (connectedSensorCount == SENSOR_COUNT) {
+  if (connectedSensorCount == targetSensorCount) {
     sortSensors();
     if (COMMS) Serial.println("All sensors connected!");
     return true;
@@ -527,7 +515,7 @@ bool connectSensors() {
     Serial.print("Timeout. Connected ");
     Serial.print(connectedSensorCount);
     Serial.print(" of ");
-    Serial.println(SENSOR_COUNT);
+    Serial.println(targetSensorCount);
   }
   return false;
 }
@@ -538,13 +526,14 @@ bool connectSensors() {
 // 'turn left' is not reassigned on reset (unless sensors change)
 // --------------------------------------------------
 void sortSensors() {
-  for (int i = 0; i < SENSOR_COUNT - 1; i++) {
-    for (int j = i + 1; j < SENSOR_COUNT; j++) {
+  for (int i = 0; i < targetSensorCount - 1; i++) {
+    for (int j = i + 1; j < targetSensorCount; j++) {
       if (String(sensors[i].client->getPeerAddress().toString().c_str()) > String(sensors[j].client->getPeerAddress().toString().c_str())) {
         SensorBLE temp = sensors[i];
         sensors[i] = sensors[j];
         sensors[j] = temp;
-        //CHANGE: swap callback assignments to keep them aligned with sensors[] after sort
+
+        //swap callback assignments to keep them aligned with sensors[] after sort
         NotifyCallback tempCB = notifyCallbacks[i];
         notifyCallbacks[i] = notifyCallbacks[j];
         notifyCallbacks[j] = tempCB;
@@ -605,26 +594,24 @@ void calibrateThreshold() {
 
   sensors[0].digitalChar->writeValue(&orangeLED, 1);
   sensors[1].digitalChar->writeValue(&orangeLED, 1);
-#if SENSOR_COUNT == 4
-  sensors[2].digitalChar->writeValue(&orangeLED, 1);
-  sensors[3].digitalChar->writeValue(&orangeLED, 1);
-#endif
+  if(targetSensorCount > 2){
+    sensors[2].digitalChar->writeValue(&orangeLED, 1);
+    sensors[3].digitalChar->writeValue(&orangeLED, 1);
+  }
 
   if (COMMS) Serial.println("Starting Calibration");
 
   sensorAverages[0] = 0;
   sensorAverages[1] = 0;
-#if SENSOR_COUNT == 4
-  sensorAverages[2] = 0;
-  sensorAverages[3] = 0;
-#endif
+  if(targetSensorCount > 2){
+    sensorAverages[2] = 0;
+    sensorAverages[3] = 0;
+  }
 
-  //CHANGE: collect SIZE_OF_AVE samples from notification values
-  //        delay(5) between samples to allow new notifications to arrive
-  int samplesCollected[SENSOR_COUNT] = { 0 };
+  int samplesCollected[targetSensorCount] = { 0 };
   while (true) {
     bool allDone = true;
-    for (int i = 0; i < SENSOR_COUNT; i++) {
+    for (int i = 0; i < targetSensorCount; i++) {
       if (samplesCollected[i] < SIZE_OF_AVE) {
         allDone = false;
         if (newValueReady[i]) {
@@ -635,19 +622,21 @@ void calibrateThreshold() {
       }
     }
     if (allDone) break;
-    delay(5);  //CHANGE: yield to allow BLE stack to deliver notifications
+    delay(5);  //yield to allow BLE stack to deliver notifications
   }
 
   setSensitivityBySensor(0, sensitivityLevels[1]);
   setSensitivityBySensor(1, sensitivityLevels[1]);
   sensors[0].digitalChar->writeValue(&greenLED, 1);
   sensors[1].digitalChar->writeValue(&greenLED, 1);
-#if SENSOR_COUNT == 4
-  setSensitivityBySensor(2, sensitivityLevels[1]);
-  setSensitivityBySensor(3, sensitivityLevels[1]);
-  sensors[2].digitalChar->writeValue(&greenLED, 1);
-  sensors[3].digitalChar->writeValue(&greenLED, 1);
-#endif
+  if(targetSensorCount > 2)
+  {
+    setSensitivityBySensor(2, sensitivityLevels[1]);
+    setSensitivityBySensor(3, sensitivityLevels[1]);
+    sensors[2].digitalChar->writeValue(&greenLED, 1);
+    sensors[3].digitalChar->writeValue(&greenLED, 1);
+  }
+  ///absljsbdlkajsbdkl
 }
 
 
