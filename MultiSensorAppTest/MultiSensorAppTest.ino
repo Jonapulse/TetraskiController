@@ -120,24 +120,29 @@ NimBLECharacteristic* pCommandChar       = nullptr;  // WRITE   — 1 byte comma
 bool phoneConnected = false;
 
 //CHANGE
+// Forward declaration — handleCommand() is used inside CommandCallbacks::onWrite()
+// which is defined before the function body appears later in the file
+void handleCommand(char cmd);
+
+//CHANGE
 // NimBLE server callbacks — track phone connect/disconnect
 class PhoneServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer) override {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  //CHANGE: newer NimBLE adds connInfo parameter
     phoneConnected = true;
     if (COMMS) Serial.println("Phone connected");
   }
-  void onDisconnect(NimBLEServer* pServer) override {
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {  //CHANGE: newer NimBLE adds connInfo + reason parameters
     phoneConnected = false;
     if (COMMS) Serial.println("Phone disconnected — restarting advertising");
     NimBLEDevice::startAdvertising();  // auto-restart so phone can reconnect
   }
 };
 
-//CHANGE
 // NimBLE characteristic callbacks — handle incoming command writes from phone
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* pChar) override {
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {  
     std::string val = pChar->getValue();
+    //TODO: check to see if this just gets whatevers printing. I might not need to pare it down to a char
     if (val.length() > 0) {
       handleCommand((char)val[0]);
     }
@@ -177,20 +182,11 @@ void setupPhonePeripheral() {
   // Configure and start advertising
   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(PHONE_SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
   pAdvertising->setName("TetraRadio");
   NimBLEDevice::startAdvertising();
 
   if (COMMS) Serial.println("BLE advertising as TetraRadio");
 }
-
-
-// --------------------------------------------------
-// Forward declaration needed because handleCommand() is called by
-// CommandCallbacks::onWrite() which is defined before handleCommand()
-// --------------------------------------------------
-//CHANGE
-void handleCommand(char cmd);
 
 
 void setup() {
@@ -201,7 +197,7 @@ void setup() {
   pinMode(26, OUTPUT);
   digitalWrite(26, HIGH);
 
-  NimBLEDevice::init("");
+  NimBLEDevice::init("TetraRadio");
 
   //CHANGE
   // Start advertising to phone before scanning for sensors,
