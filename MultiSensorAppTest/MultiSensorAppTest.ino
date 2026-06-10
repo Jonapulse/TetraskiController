@@ -190,12 +190,15 @@ void setup() {
 
   NimBLEDevice::init("TetraRadio");
 
-  //TODO: Check fors saved data, including sensor count
-  targetSensorCount = 2;
-
   setupPhonePeripheral();
 
-  // Connect sensors
+  //TODO: check save for previous targetSensorCount
+  targetSensorCount = MAX_SENSOR_COUNT;
+  scanAndConnectSensors();
+}
+
+void scanAndConnectSensors()
+{
   while (1) {  //Enter connection loop
 
     //attempt to connect again until connection established
@@ -212,6 +215,8 @@ void setup() {
     }
   }
 
+  //Check save
+
   //perform initial calibration
   calibrateThreshold();
 }
@@ -220,15 +225,8 @@ void setup() {
 
 // --------------------------------------------------
 // loop -
-// read/respond to serial input
-// 'w' - enter wifi pairing
-// '5' - calibrate sensors
-// 'c'/'f' - confirmation bytes for control change and calibration
-// '0,1,2'/'6,7,8'/'i,j,k'/'l,m,n' - sensitivity for sensors 0,1,2,3
-// '3,4'/'g,h' - set 'left/right' sensors to standard or inverted controls
 // --------------------------------------------------
 void loop() {
-
   //check for incoming comms from TetraSki
   if (Serial.available()) {
     char incomingByte = Serial.read();
@@ -306,10 +304,16 @@ void loop() {
 
 // --------------------------------------------------
 // Shared command handler (serial + BLE phone)
+// read/respond to serial input
+// 'w' - enter wifi pairing
+// '5' - calibrate sensors
+// 'c'/'f' - confirmation bytes for control change and calibration
+// '0','1','2'/'6','7','8'/'i','j','k'/'l','m','n' - sensitivity for sensors 0,1,2,3
+// '3','4'/'g','h' - set 'left','right'/'wedge in','wedge out' sensors to standard or inverted controls
+// 'o'/'p' - set sensor count to '2'/'4'.
 // --------------------------------------------------
 // TODO: Update loop so it can handle multi-char
-// Handles commands from both serial (TetraSki) and BLE phone writes.
-// Extracted so CommandCallbacks::onWrite() and loop() share one implementation.
+// Extracted so CommandCallbacks::onWrite() (phone app) and loop() (instructor override control) share one implementation.
 void handleCommand(char cmd) {
   switch (cmd) {
 
@@ -397,6 +401,17 @@ void handleCommand(char cmd) {
       }
       Serial.print('c');
       break;
+
+    case 'o':
+      targetSensorCount = 2;
+      if(connectedSensorCount < targetSensorCount)
+        scanAndConnectSensors();
+      break;
+    case 'p':
+      targetSensorCount = 4;
+      if(connectedSensorCount < targetSensorCount)
+        scanAndConnectSensors();
+      break;
   }
 }
 
@@ -405,8 +420,6 @@ void handleCommand(char cmd) {
 // Connect to N sensors matching target local name
 // --------------------------------------------------
 bool connectSensors() {
-  connectedSensorCount = 0;
-
   if (COMMS) Serial.println("Scanning for sensors...");
 
   NimBLEScan* pScan = NimBLEDevice::getScan();
