@@ -13,7 +13,6 @@ const char* ssid = "TetraOTA";
 const char* password = "tetra2034";
 bool OTAUpdateEnable = 0;
 
-
 /************ BLE Sensor Stuff ************************************************/
 const char* targetLocalName = "ANR Corp M40";  // Match any device with the name for Muscle Sense Model M40
 
@@ -501,6 +500,9 @@ bool connectSensors() {
         }
 
         connectedSensorCount++;
+        
+        if(connectedSensorCount == targetSensorCount)
+          break;
       }
     }
   }
