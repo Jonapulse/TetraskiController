@@ -2,6 +2,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include "NimBLEDevice.h"
+#include <Preferences.h>  
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
@@ -37,6 +38,8 @@ int connectedSensorCount = 0;
 
 volatile uint16_t latestAnalogValues[MAX_SENSOR_COUNT] = { 0 };
 volatile bool newValueReady[MAX_SENSOR_COUNT] = { false };
+
+volatile bool sensorDisconnectFlagged = false;
 
 #define RECONNECT_FREQ 10000
 
@@ -102,6 +105,18 @@ NotifyCallback notifyCallbacks[4] = {
   notifyCallback3
 };
 
+class SensorClientCallbacks : public NimBLEClientCallbacks {
+  void onDisconnect(NimBLEClient* pClient, int reason) override {
+    connectedSensorCount--;
+    sensorDisconnectFlagged = true;
+    if (COMMS) {
+      Serial.print("Sensor disconnected: ");
+      Serial.println(pClient->getPeerAddress().toString().c_str());
+    }
+  }
+};
+SensorClientCallbacks sensorClientCallbacks;
+
 
 /************ NimBLE Phone Peripheral Stuff **************************************/
 
@@ -119,6 +134,8 @@ bool phoneConnected = false;
 
 // Forward declaration — handleCommand() is used inside CommandCallbacks::onWrite()
 void handleCommand(char cmd);
+void scanAndConnectSensors(bool isReconnect = false); //Arduino's pre-compiler was failing to auto-generate these when arguments were added
+bool connectSensors(bool isReconnect = false);
 
 // NimBLE server callbacks — track phone connect/disconnect
 class PhoneServerCallbacks : public NimBLEServerCallbacks {
@@ -180,6 +197,116 @@ void setupPhonePeripheral() {
 }
 
 
+/************ Persistent Save/Restore *****************************************/
+// Stored in NVS under namespace "tetra" using the Preferences library.
+// Keys:
+//   "sensorCount"     - int,    targetSensorCount
+//   "out0".."out3"    - int,    sensorOutputs[i]  (encodes per-pair inversion)
+//   "thresh0".."th3"  - ushort, sensorThresholds[i]
+//   "ave0".."ave3"    - ushort, sensorAverages[i]
+//   "mac0".."mac3"    - String, MAC address of sensor[i] at time of save
+//
+// Slots 2–3 are never overwritten while in 2-sensor mode, so their data
+// is preserved in case the user switches back to 4-sensor mode.
+
+Preferences prefs;
+
+void saveSettings() {
+  prefs.begin("tetra", false);  // false = read/write
+
+  prefs.putInt("sensorCount", targetSensorCount);
+
+  for (int i = 0; i < targetSensorCount; i++) {
+    char key[8];
+
+    snprintf(key, sizeof(key), "out%d", i);
+    prefs.putInt(key, sensorOutputs[i]);
+
+    snprintf(key, sizeof(key), "thresh%d", i);
+    prefs.putUShort(key, sensorThresholds[i]);
+
+    snprintf(key, sizeof(key), "ave%d", i);
+    prefs.putUShort(key, sensorAverages[i]);
+
+    snprintf(key, sizeof(key), "mac%d", i);
+    if (sensors[i].client) {
+      prefs.putString(key, sensors[i].client->getPeerAddress().toString().c_str());
+    }
+  }
+  // Slots beyond targetSensorCount are intentionally left untouched.
+
+  prefs.end();
+  if (COMMS) Serial.println("Settings saved.");
+}
+
+// Returns true if every sensor slot relevant to the current targetSensorCount
+// matches a saved MAC. On true, restores thresholds, averages, and outputs
+// for those slots so calibration can be skipped.
+// NOTE: Save stores data for up to 4 sensors. For 2 sensor setting, higher sensor 
+// data is not saved or read but remains present.
+bool loadAndMatchSettings() {
+  prefs.begin("tetra", true);  // true = read-only
+
+  // Restore sensor count and per-pair inversion for all 4 slots regardless of
+  // current mode, so outputs are always consistent with last save.
+  int savedCount = prefs.getInt("sensorCount", -1);
+  if (savedCount == -1) {
+    // No save exists yet
+    prefs.end();
+    if (COMMS) Serial.println("No save found — calibrating fresh.");
+    return false;
+  }
+
+  // Restore sensorOutputs for all 4 slots (safe to always do this)
+  for (int i = 0; i < MAX_SENSOR_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "out%d", i);
+    sensorOutputs[i] = prefs.getInt(key, sensorOutputs[i]);
+  }
+
+  // Check MACs for slots relevant to current mode only
+  bool match = true;
+  for (int i = 0; i < targetSensorCount; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "mac%d", i);
+    String savedMAC = prefs.getString(key, "");
+    String currentMAC = sensors[i].client
+      ? String(sensors[i].client->getPeerAddress().toString().c_str())
+      : String("");
+
+    if (savedMAC == "" || savedMAC != currentMAC) {
+      if (COMMS) {
+        Serial.print("MAC mismatch on slot ");
+        Serial.print(i);
+        Serial.print(": saved=");
+        Serial.print(savedMAC);
+        Serial.print(" current=");
+        Serial.println(currentMAC);
+      }
+      match = false;
+      break;
+    }
+  }
+
+  if (match) {
+    // Restore thresholds and averages for current mode's slots
+    for (int i = 0; i < targetSensorCount; i++) {
+      char key[8];
+      snprintf(key, sizeof(key), "thresh%d", i);
+      sensorThresholds[i] = prefs.getUShort(key, 0);
+      snprintf(key, sizeof(key), "ave%d", i);
+      sensorAverages[i] = prefs.getUShort(key, 0);
+    }
+    if (COMMS) Serial.println("Sensors match save — skipping calibration.");
+  } else {
+    if (COMMS) Serial.println("Sensors do not match save — calibrating fresh.");
+  }
+
+  prefs.end();
+  return match;
+}
+
+
 void setup() {
 
   Serial.begin(57600);
@@ -192,17 +319,19 @@ void setup() {
 
   setupPhonePeripheral();
 
-  //TODO: check save for previous targetSensorCount
-  targetSensorCount = MAX_SENSOR_COUNT;
+  prefs.begin("tetra", true);
+  targetSensorCount = prefs.getInt("sensorCount", MAX_SENSOR_COUNT);
+  prefs.end();
+
   scanAndConnectSensors();
 }
 
-void scanAndConnectSensors()
+void scanAndConnectSensors(bool isReconnect)
 {
   while (1) {  //Enter connection loop
 
     //attempt to connect again until connection established
-    if (connectSensors()) {
+    if (connectSensors(isReconnect)) {
       Serial.print('$');  // Signal successful connection to ski
       break;
     }
@@ -215,10 +344,13 @@ void scanAndConnectSensors()
     }
   }
 
-  //Check save
+  //check if connected sensors match save; skip calibration if they do
+  if (!loadAndMatchSettings()) {
+    calibrateThreshold();
+    saveSettings();  // save fresh calibration
+  }
 
-  //perform initial calibration
-  calibrateThreshold();
+  sensorDisconnectFlagged = false;  // clear after successful reconnect, not before — avoids missing a drop that occurs during the reconnect attempt
 }
 
 
@@ -233,6 +365,29 @@ void loop() {
     handleCommand(incomingByte); 
   }
 
+  readAndPrintSensors();
+
+  // Checked here so reconnect happens from loop() rather than the BLE stack thread.
+  if (sensorDisconnectFlagged) {
+    if (COMMS) Serial.println("Sensor drop detected — reconnecting...");
+    scanAndConnectSensors(true);  // isReconnect=true: skips sort, uses saved MAC slots
+  }
+}
+
+// --------------------------------------------------
+// readAndPrintSensors -
+// Reads sensor pair (or pairs for 4 sensor setting) and prints output
+// For convenience, also periodically (set to 5s) checks battery charge and updates 
+// sensor LEDs.
+// 
+// NOTE: slope calculation was added to give expected output in the common experience where
+// the user has activated one sensor and changing to the other sensor. Commonly, both sensors
+// will be active during this transition, but measuring the slope will let us respond with the
+// sensor the user is moving towards MUCH more quickly than waiting for the sensor they are 
+// moving away from to fully deactivate.
+// --------------------------------------------------
+void readAndPrintSensors()
+{
   for (int i = 0; i < targetSensorCount; i += 2) {
     if (newValueReady[i] && newValueReady[i + 1]) {
       uint16_t valA = latestAnalogValues[i];
@@ -295,6 +450,17 @@ void loop() {
           if (battValB.length() > 0) battB = (uint8_t)battValB[0];
           uint8_t battPayload[2] = { battA, battB };
           pBatteryDataChar->setValue(battPayload, 2);
+
+          //update sensor LED color based on battery level after each periodic read
+          // >66% -> 6 (green-green), >33% -> 7 (green-red), else -> 11 (red-red)
+          uint8_t battLevels[2] = { battA, battB };
+          for (int s = 0; s < 2; s++) {
+            uint8_t ledCode;
+            if (battLevels[s] > 66)     ledCode = 6;
+            else if (battLevels[s] > 33) ledCode = 7;
+            else                         ledCode = 11;
+            sensors[s].digitalChar->writeValue(&ledCode, 1);
+          }
         }
       }
     }
@@ -337,23 +503,27 @@ void handleCommand(char cmd) {
         Serial.println(sensitivityLevels[cmd - '0']);
       }
       Serial.print('c');
+      saveSettings();  
       break;
 
     case '3':
       sensorOutputs[0] = 1;
       sensorOutputs[1] = 2;
       Serial.print('c');
+      saveSettings(); 
       break;
 
     case '4':
       sensorOutputs[0] = 2;
       sensorOutputs[1] = 1;
       Serial.print('c');
+      saveSettings(); 
       break;
 
     case '5':
       Serial.print('c');
       calibrateThreshold();
+      saveSettings();
       Serial.print('f');
       break;
 
@@ -366,18 +536,21 @@ void handleCommand(char cmd) {
         Serial.println(sensitivityLevels[cmd - '6']);
       }
       Serial.print('c');
+      saveSettings();  
       break;
 
     case 'g':
       sensorOutputs[2] = 3;
       sensorOutputs[3] = 4;
       Serial.print('c');
+      saveSettings();  
       break;
 
     case 'h':
       sensorOutputs[2] = 4;
       sensorOutputs[3] = 3;
       Serial.print('c');
+      saveSettings();  
       break;
 
     case 'i':
@@ -389,6 +562,7 @@ void handleCommand(char cmd) {
         Serial.println(sensitivityLevels[cmd - 'i']);
       }
       Serial.print('c');
+      saveSettings();
       break;
 
     case 'l':
@@ -400,26 +574,31 @@ void handleCommand(char cmd) {
         Serial.println(sensitivityLevels[cmd - 'l']);
       }
       Serial.print('c');
+      saveSettings();  
       break;
 
     case 'o':
       targetSensorCount = 2;
-      if(connectedSensorCount < targetSensorCount)
-        scanAndConnectSensors();
+      if(connectedSensorCount > 2)
+        connectedSensorCount = 2;
+      saveSettings(); 
       break;
+
     case 'p':
       targetSensorCount = 4;
+      saveSettings(); 
       if(connectedSensorCount < targetSensorCount)
         scanAndConnectSensors();
       break;
   }
 }
 
-
 // --------------------------------------------------
 // Connect to N sensors matching target local name
+// isReconnect: true when recovering from a drop — skips sortSensors() since
+// sensors are placed directly into their saved MAC slots.
 // --------------------------------------------------
-bool connectSensors() {
+bool connectSensors(bool isReconnect) {
   if (COMMS) Serial.println("Scanning for sensors...");
 
   NimBLEScan* pScan = NimBLEDevice::getScan();
@@ -448,13 +627,50 @@ bool connectSensors() {
           Serial.println(device->getAddress().toString().c_str());
         }
 
-        SensorBLE& sensor = sensors[connectedSensorCount];
+        String foundMAC = String(device->getAddress().toString().c_str());
+
+        // Skip sensors that are already connected — avoids duplicate clients on reconnect
+        bool alreadyConnected = false;
+        for (int s = 0; s < targetSensorCount; s++) {
+          if (sensors[s].client && sensors[s].client->isConnected() &&
+              String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
+            if (COMMS) Serial.println("Already connected, skipping");
+            alreadyConnected = true;
+            break;
+          }
+        }
+        if (alreadyConnected) continue;
+
+        // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
+        int targetSlot = connectedSensorCount;
+        for (int s = 0; s < targetSensorCount; s++) {
+          if (!sensors[s].client || !sensors[s].client->isConnected()) {
+            // Check if saved MAC for this slot matches
+            prefs.begin("tetra", true);
+            char key[8];
+            snprintf(key, sizeof(key), "mac%d", s);
+            String savedMAC = prefs.getString(key, "");
+            prefs.end();
+            if (savedMAC == foundMAC) {
+              targetSlot = s;
+              if (COMMS) {
+                Serial.print("Matched to saved slot ");
+                Serial.println(s);
+              }
+              break;
+            }
+          }
+        }
+
+        SensorBLE& sensor = sensors[targetSlot];
 
         sensor.client = NimBLEDevice::createClient();
         if (!sensor.client) {
           if (COMMS) Serial.println("Client creation failed, skipping");
           continue;
         }
+
+        sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
 
         if (!sensor.client->connect(device)) {
           if (COMMS) Serial.println("Connection failed, skipping");
@@ -499,7 +715,7 @@ bool connectSensors() {
         }
 
         // notifyCallbacks[] maps sensor index to its callback function
-        if (!sensor.analogChar->subscribe(true, notifyCallbacks[connectedSensorCount])) {
+        if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
           if (COMMS) Serial.println("Notification subscription failed, skipping");
           sensor.client->disconnect();
           continue;
@@ -507,7 +723,7 @@ bool connectSensors() {
 
         if (COMMS) {
           Serial.print("Sensor ");
-          Serial.print(connectedSensorCount);
+          Serial.print(targetSlot);
           Serial.print(" connected and subscribed: ");
           Serial.println(device->getAddress().toString().c_str());
         }
@@ -521,7 +737,12 @@ bool connectSensors() {
   }
 
   if (connectedSensorCount == targetSensorCount) {
-    sortSensors();
+    // Only sort on initial connection. On reconnect, sensors are placed directly
+    // into their saved MAC slots in connectSensors(), so sort would scramble callbacks.
+    if (!isReconnect) {
+      sortSensors();
+    }
+    //if (COMMS) debugPrintSensors();
     if (COMMS) Serial.println("All sensors connected!");
     return true;
   }
@@ -534,6 +755,14 @@ bool connectSensors() {
   }
   return false;
 }
+
+// void debugPrintSensors()
+// {
+//   Serial.print("sensors for...");
+//   Serial.print(targetSensorCount);
+//   for(int i = 0; i < targetSensorCount; i++)
+//     Serial.print(sensors[i].client->getPeerAddress().toString().c_str());
+// }
 
 // --------------------------------------------------
 // Sort Sensors - ensures Muscle Sensors detected in
@@ -591,7 +820,6 @@ float computeSlope(uint16_t* buffer) {
   return (N * sumXY - sumX * sumY) / denominator;
 }
 
-//TODO: Update to individual thresholds
 // --------------------------------------------------
 // Set Sensitivity by sensor
 // --------------------------------------------------
@@ -605,25 +833,15 @@ void setSensitivityBySensor(uint16_t sensor, uint16_t value) {
 void calibrateThreshold() {
 
   uint8_t orangeLED = 12;
-  uint8_t greenLED = 5;
 
-  sensors[0].digitalChar->writeValue(&orangeLED, 1);
-  sensors[1].digitalChar->writeValue(&orangeLED, 1);
-  if(targetSensorCount > 2){
-    sensors[2].digitalChar->writeValue(&orangeLED, 1);
-    sensors[3].digitalChar->writeValue(&orangeLED, 1);
+  for (int i = 0; i < targetSensorCount; i++) {
+    sensors[i].digitalChar->writeValue(&orangeLED, 1);
+    sensorAverages[i] = 0;
   }
 
   if (COMMS) Serial.println("Starting Calibration");
 
-  sensorAverages[0] = 0;
-  sensorAverages[1] = 0;
-  if(targetSensorCount > 2){
-    sensorAverages[2] = 0;
-    sensorAverages[3] = 0;
-  }
-
-  int samplesCollected[targetSensorCount] = { 0 };
+  int samplesCollected[MAX_SENSOR_COUNT] = { 0 };
   while (true) {
     bool allDone = true;
     for (int i = 0; i < targetSensorCount; i++) {
@@ -640,18 +858,9 @@ void calibrateThreshold() {
     delay(5);  //yield to allow BLE stack to deliver notifications
   }
 
-  setSensitivityBySensor(0, sensitivityLevels[1]);
-  setSensitivityBySensor(1, sensitivityLevels[1]);
-  sensors[0].digitalChar->writeValue(&greenLED, 1);
-  sensors[1].digitalChar->writeValue(&greenLED, 1);
-  if(targetSensorCount > 2)
-  {
-    setSensitivityBySensor(2, sensitivityLevels[1]);
-    setSensitivityBySensor(3, sensitivityLevels[1]);
-    sensors[2].digitalChar->writeValue(&greenLED, 1);
-    sensors[3].digitalChar->writeValue(&greenLED, 1);
+  for (int i = 0; i < targetSensorCount; i++) {
+    setSensitivityBySensor(i, sensitivityLevels[1]);
   }
-  ///absljsbdlkajsbdkl
 }
 
 
