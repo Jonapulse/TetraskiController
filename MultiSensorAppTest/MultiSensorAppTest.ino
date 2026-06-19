@@ -46,6 +46,7 @@ volatile bool sensorDisconnectFlagged = false;
 //Sensitivities
 const uint8_t sensitivityLevels[3] = { 20, 50, 80 };
 uint16_t sensorThresholds[MAX_SENSOR_COUNT];
+uint8_t sensitivityIndices[MAX_SENSOR_COUNT] = { 1, 1, 1, 1 };  //CHANGE: track which sensitivityLevels[] index each sensor is set to
 
 //Directions
 int sensorOutputs[MAX_SENSOR_COUNT] = { 1, 2, 3, 4 };  //1 - left, 2 - right, FOR targetSensorCount > 2: 3 - wedge in, 4 - wedge out
@@ -125,11 +126,13 @@ SensorClientCallbacks sensorClientCallbacks;
 #define SENSOR_DATA_CHAR_UUID   "12345678-1234-1234-1234-123456789abd"
 #define BATTERY_DATA_CHAR_UUID  "12345678-1234-1234-1234-123456789abe"
 #define COMMAND_CHAR_UUID       "12345678-1234-1234-1234-123456789abf"
+#define CONFIG_CHAR_UUID        "12345678-1234-1234-1234-123456789ac0"  //CHANGE: one-shot config packet on phone connect
 
 NimBLEServer*         pPhoneServer       = nullptr;
 NimBLECharacteristic* pSensorDataChar    = nullptr;  // NOTIFY  — 5 bytes: [dir, t2h, t2l, t3h, t3l]
 NimBLECharacteristic* pBatteryDataChar   = nullptr;  // READ    — 2 bytes: [battT2, battT3]
 NimBLECharacteristic* pCommandChar       = nullptr;  // WRITE   — 1 byte command
+NimBLECharacteristic* pConfigChar        = nullptr;  //CHANGE: NOTIFY — 6 bytes: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
 bool phoneConnected = false;
 
 // Forward declaration — handleCommand() is used inside CommandCallbacks::onWrite()
@@ -142,6 +145,23 @@ class PhoneServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  
     phoneConnected = true;
     if (COMMS) Serial.println("Phone connected");
+    // CHANGE: Send current settings to phone so app displays correct state on connect.
+    // Byte layout: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
+    // inversionFlags bit 0 = pair 0 inverted (sensorOutputs[0]==2)
+    //                bit 1 = pair 1 inverted (sensorOutputs[2]==4)
+    uint8_t invFlags = 0;
+    if (sensorOutputs[0] == 2) invFlags |= 0x01;
+    if (sensorOutputs[2] == 4) invFlags |= 0x02;
+    uint8_t configPayload[6] = {
+      (uint8_t)targetSensorCount,
+      invFlags,
+      sensitivityIndices[0],
+      sensitivityIndices[1],
+      sensitivityIndices[2],
+      sensitivityIndices[3]
+    };
+    pConfigChar->setValue(configPayload, 6);
+    pConfigChar->notify();
   }
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override { 
     phoneConnected = false;
@@ -185,6 +205,12 @@ void setupPhonePeripheral() {
   );
   pCommandChar->setCallbacks(new CommandCallbacks());
 
+  // CHANGE: Config: NOTIFY — pushed once when phone connects to sync app display state
+  pConfigChar = pService->createCharacteristic(
+    CONFIG_CHAR_UUID,
+    NIMBLE_PROPERTY::NOTIFY
+  );
+
   pService->start();
 
   // Configure and start advertising
@@ -224,6 +250,9 @@ void saveSettings() {
 
     snprintf(key, sizeof(key), "thresh%d", i);
     prefs.putUShort(key, sensorThresholds[i]);
+
+    snprintf(key, sizeof(key), "sensIdx%d", i);  //CHANGE: persist sensitivity index for config handshake
+    prefs.putUChar(key, sensitivityIndices[i]);
 
     snprintf(key, sizeof(key), "ave%d", i);
     prefs.putUShort(key, sensorAverages[i]);
@@ -294,6 +323,8 @@ bool loadAndMatchSettings() {
       char key[8];
       snprintf(key, sizeof(key), "thresh%d", i);
       sensorThresholds[i] = prefs.getUShort(key, 0);
+      snprintf(key, sizeof(key), "sensIdx%d", i);  //CHANGE: restore sensitivity index
+      sensitivityIndices[i] = prefs.getUChar(key, 1);
       snprintf(key, sizeof(key), "ave%d", i);
       sensorAverages[i] = prefs.getUShort(key, 0);
     }
@@ -427,16 +458,22 @@ void readAndPrintSensors()
       Serial.print(currentDirection);
 
       // Broadcast sensor data to phone if connected.
-      // Only broadcasting the first pair (sensors 0+1) for now —
-      // expand payload if the app is updated to display all 4 sensors.
+      // Payload layout (10 bytes):
+      //   [0]     direction pair 0   (0=idle, 1=left, 2=right)
+      //   [1-2]   valA (sensor 0) big-endian
+      //   [3-4]   valB (sensor 1) big-endian
+      //   [5]     direction pair 1   (0=idle, 3=wedge in, 4=wedge out) — 0 in 2-sensor mode
+      //   [6-7]   valA (sensor 2) big-endian — 0 in 2-sensor mode
+      //   [8-9]   valB (sensor 3) big-endian — 0 in 2-sensor mode
       if (phoneConnected && i == 0) {
-        uint8_t payload[5];
+        uint8_t payload[10] = { 0 };
         payload[0] = (uint8_t)currentDirection;
         payload[1] = (uint8_t)(valA >> 8);
         payload[2] = (uint8_t)(valA & 0xFF);
         payload[3] = (uint8_t)(valB >> 8);
         payload[4] = (uint8_t)(valB & 0xFF);
-        pSensorDataChar->setValue(payload, 5);
+        // Bytes 5-9 stay zero in 2-sensor mode; filled by pair 1 iteration below.
+        pSensorDataChar->setValue(payload, 10);
         pSensorDataChar->notify();
 
         // Read and broadcast battery levels periodically
@@ -461,6 +498,22 @@ void readAndPrintSensors()
             else                         ledCode = 11;
             sensors[s].digitalChar->writeValue(&ledCode, 1);
           }
+        }
+      }
+      if (phoneConnected && i == 2) {
+        // Patch pair 1 data into bytes 5-9 of the characteristic.
+        // Read current value, update pair 1 bytes, re-set without notifying —
+        // pair 0 already sent the notify for this frame.
+        std::string current = pSensorDataChar->getValue();
+        if (current.length() == 10) {
+          uint8_t payload[10];
+          memcpy(payload, current.data(), 10);
+          payload[5] = (uint8_t)currentDirection;
+          payload[6] = (uint8_t)(valA >> 8);
+          payload[7] = (uint8_t)(valA & 0xFF);
+          payload[8] = (uint8_t)(valB >> 8);
+          payload[9] = (uint8_t)(valB & 0xFF);
+          pSensorDataChar->setValue(payload, 10);
         }
       }
     }
@@ -498,6 +551,7 @@ void handleCommand(char cmd) {
     case '1':
     case '2':
       setSensitivityBySensor(0, sensitivityLevels[cmd - '0']);
+      sensitivityIndices[0] = cmd - '0';  //CHANGE: track index for config handshake
       if (COMMS) {
         Serial.print("\nSensitivity for sensor 0 set to ");
         Serial.println(sensitivityLevels[cmd - '0']);
@@ -531,6 +585,7 @@ void handleCommand(char cmd) {
     case '7':
     case '8':
       setSensitivityBySensor(1, sensitivityLevels[cmd - '6']);
+      sensitivityIndices[1] = cmd - '6';  //CHANGE: track index for config handshake
       if (COMMS) {
         Serial.print("\nSensitivity for sensor 1 set to ");
         Serial.println(sensitivityLevels[cmd - '6']);
@@ -557,6 +612,7 @@ void handleCommand(char cmd) {
     case 'j':
     case 'k':
       setSensitivityBySensor(2, sensitivityLevels[cmd - 'i']);
+      sensitivityIndices[2] = cmd - 'i';  //CHANGE: track index for config handshake
       if (COMMS) {
         Serial.print("\nSensitivity for sensor 2 set to ");
         Serial.println(sensitivityLevels[cmd - 'i']);
@@ -569,6 +625,7 @@ void handleCommand(char cmd) {
     case 'm':
     case 'n':
       setSensitivityBySensor(3, sensitivityLevels[cmd - 'l']);
+      sensitivityIndices[3] = cmd - 'l';  //CHANGE: track index for config handshake
       if (COMMS) {
         Serial.print("\nSensitivity for sensor 3 set to ");
         Serial.println(sensitivityLevels[cmd - 'l']);
