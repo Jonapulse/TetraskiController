@@ -130,7 +130,7 @@ SensorClientCallbacks sensorClientCallbacks;
 
 NimBLEServer*         pPhoneServer       = nullptr;
 NimBLECharacteristic* pSensorDataChar    = nullptr;  // NOTIFY  — 5 bytes: [dir, t2h, t2l, t3h, t3l]
-NimBLECharacteristic* pBatteryDataChar   = nullptr;  // READ    — 2 bytes: [battT2, battT3]
+NimBLECharacteristic* pBatteryDataChar   = nullptr;  // READ    — 4 bytes: [batt0, batt1, batt2, batt3]
 NimBLECharacteristic* pCommandChar       = nullptr;  // WRITE   — 1 byte command
 NimBLECharacteristic* pConfigChar        = nullptr;  // NOTIFY — 6 bytes: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
 bool phoneConnected = false;
@@ -145,7 +145,7 @@ class PhoneServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  
     phoneConnected = true;
     if (COMMS) Serial.println("Phone connected");
-
+    
     // Send current settings to phone so app displays correct state on connect.
     // Byte layout: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
     // inversionFlags bit 0 = pair 0 inverted (sensorOutputs[0]==2)
@@ -206,6 +206,7 @@ void setupPhonePeripheral() {
   );
   pCommandChar->setCallbacks(new CommandCallbacks());
 
+  // Config: NOTIFY — pushed once when phone connects to sync app display state
   pConfigChar = pService->createCharacteristic(
     CONFIG_CHAR_UUID,
     NIMBLE_PROPERTY::NOTIFY
@@ -251,7 +252,7 @@ void saveSettings() {
     snprintf(key, sizeof(key), "thresh%d", i);
     prefs.putUShort(key, sensorThresholds[i]);
 
-    snprintf(key, sizeof(key), "sensIdx%d", i);  
+    snprintf(key, sizeof(key), "sensIdx%d", i);  //persist sensitivity index for config handshake
     prefs.putUChar(key, sensitivityIndices[i]);
 
     snprintf(key, sizeof(key), "ave%d", i);
@@ -323,7 +324,7 @@ bool loadAndMatchSettings() {
       char key[8];
       snprintf(key, sizeof(key), "thresh%d", i);
       sensorThresholds[i] = prefs.getUShort(key, 0);
-      snprintf(key, sizeof(key), "sensIdx%d", i);  
+      snprintf(key, sizeof(key), "sensIdx%d", i);  //restore sensitivity index
       sensitivityIndices[i] = prefs.getUChar(key, 1);
       snprintf(key, sizeof(key), "ave%d", i);
       sensorAverages[i] = prefs.getUShort(key, 0);
@@ -485,22 +486,21 @@ void readAndPrintSensors()
         static unsigned long lastBattUpdate = 0;
         if (millis() - lastBattUpdate > 5000) {  // every 5 seconds
           lastBattUpdate = millis();
-          uint8_t battA = 0, battB = 0;
-          std::string battValA = sensors[0].batteryChar->readValue();
-          std::string battValB = sensors[1].batteryChar->readValue();
-          if (battValA.length() > 0) battA = (uint8_t)battValA[0];
-          if (battValB.length() > 0) battB = (uint8_t)battValB[0];
-          uint8_t battPayload[2] = { battA, battB };
-          pBatteryDataChar->setValue(battPayload, 2);
+          uint8_t battLevels[4] = { 0, 0, 0, 0 };
+          int activeSensors = (targetSensorCount == 4) ? 4 : 2;
+          for (int s = 0; s < activeSensors; s++) {
+            std::string battVal = sensors[s].batteryChar->readValue();
+            if (battVal.length() > 0) battLevels[s] = (uint8_t)battVal[0];
+          }
+          pBatteryDataChar->setValue(battLevels, 4);
 
           //update sensor LED color based on battery level after each periodic read
           // >66% -> 6 (green-green), >33% -> 7 (green-red), else -> 11 (red-red)
-          uint8_t battLevels[2] = { battA, battB };
-          for (int s = 0; s < 2; s++) {
+          for (int s = 0; s < activeSensors; s++) {
             uint8_t ledCode;
-            if (battLevels[s] > 66)     ledCode = 6;
+            if (battLevels[s] > 66)      ledCode = 6;
             else if (battLevels[s] > 33) ledCode = 7;
-            else                         ledCode = 11;
+            else                          ledCode = 11;
             sensors[s].digitalChar->writeValue(&ledCode, 1);
           }
         }
@@ -556,7 +556,7 @@ void handleCommand(char cmd) {
     case '1':
     case '2':
       setSensitivityBySensor(0, sensitivityLevels[cmd - '0']);
-      sensitivityIndices[0] = cmd - '0';  
+      sensitivityIndices[0] = cmd - '0';  //track index for config handshake
       if (COMMS) {
         Serial.print("\nSensitivity for sensor 0 set to ");
         Serial.println(sensitivityLevels[cmd - '0']);
@@ -590,7 +590,7 @@ void handleCommand(char cmd) {
     case '7':
     case '8':
       setSensitivityBySensor(1, sensitivityLevels[cmd - '6']);
-      sensitivityIndices[1] = cmd - '6'; 
+      sensitivityIndices[1] = cmd - '6';  
       if (COMMS) {
         Serial.print("\nSensitivity for sensor 1 set to ");
         Serial.println(sensitivityLevels[cmd - '6']);
