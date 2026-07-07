@@ -41,7 +41,7 @@ volatile bool newValueReady[MAX_SENSOR_COUNT] = { false };
 
 volatile bool sensorDisconnectFlagged = false;
 
-#define RECONNECT_FREQ 10000
+#define RECONNECT_FREQ 10000 //10 seconds
 
 //Sensitivities
 const uint8_t sensitivityLevels[3] = { 20, 50, 80 };
@@ -51,6 +51,10 @@ uint8_t sensitivityIndices[MAX_SENSOR_COUNT] = { 1, 1, 1, 1 };
 //Directions
 int sensorOutputs[MAX_SENSOR_COUNT] = { 1, 2, 3, 4 };  //1 - left, 2 - right, FOR targetSensorCount > 2: 3 - wedge in, 4 - wedge out
 int idle = 0;
+
+#define BATTERY_UPDATE_FREQ 5000 //5 seconds
+#define WEDGE_OUTPUT_FREQ 500 //0.5 seconds
+long lastWedgeActivation = 0;
 
 uint16_t sensorAverages[MAX_SENSOR_COUNT];
 const int SIZE_OF_AVE = 200;
@@ -385,10 +389,8 @@ void scanAndConnectSensors(bool isReconnect)
   sensorDisconnectFlagged = false;  // clear after successful reconnect, not before — avoids missing a drop that occurs during the reconnect attempt
 }
 
-
-
 // --------------------------------------------------
-// loop -
+// RUNTIME LOOP
 // --------------------------------------------------
 void loop() {
   //check for incoming comms from TetraSki
@@ -412,14 +414,15 @@ void loop() {
 // For convenience, also periodically (set to 5s) checks battery charge and updates 
 // sensor LEDs.
 // 
-// NOTE: slope calculation was added to give expected output in the common experience where
-// the user has activated one sensor and changing to the other sensor. Commonly, both sensors
-// will be active during this transition, but measuring the slope will let us respond with the
-// sensor the user is moving towards MUCH more quickly than waiting for the sensor they are 
+// NOTE: slope calculation was added to give expected output in the common use-case where the 
+// user has been activating one sensor and changes to activate the other sensor. Commonly, both 
+// sensors will be active during this transition. Measuring the slope will let us respond with 
+// the sensor the user is moving towards much more quickly than waiting for the sensor they are 
 // moving away from to fully deactivate.
 // --------------------------------------------------
 void readAndPrintSensors()
 {
+  //Iterate over sensors by pair
   for (int i = 0; i < targetSensorCount; i += 2) {
     if (newValueReady[i] && newValueReady[i + 1]) {
       uint16_t valA = latestAnalogValues[i];
@@ -456,7 +459,16 @@ void readAndPrintSensors()
       }
 
       //output direction over serial to TetraSki
-      Serial.print(currentDirection);
+      //Special case 2nd pair - 0.5s cooldown on use
+      if(i == 2){
+        if(millis() - lastWedgeActivation > WEDGE_OUTPUT_FREQ && currentDirection > 0){
+          lastWedgeActivation = millis();
+          Serial.print(currentDirection);
+        }
+      }
+      else {
+        Serial.print(currentDirection);
+      }
 
       // Broadcast sensor data to phone if connected.
       // Payload layout (10 bytes):
@@ -484,7 +496,7 @@ void readAndPrintSensors()
 
         // Read and broadcast battery levels periodically
         static unsigned long lastBattUpdate = 0;
-        if (millis() - lastBattUpdate > 5000) {  // every 5 seconds
+        if (millis() - lastBattUpdate > BATTERY_UPDATE_FREQ) {  // every 5 seconds
           lastBattUpdate = millis();
           uint8_t battLevels[4] = { 0, 0, 0, 0 };
           int activeSensors = (targetSensorCount == 4) ? 4 : 2;
@@ -536,7 +548,6 @@ void readAndPrintSensors()
 // '3','4'/'g','h' - set 'left','right'/'wedge in','wedge out' sensors to standard or inverted controls
 // 'o'/'p' - set sensor count to '2'/'4'.
 // --------------------------------------------------
-// TODO: Update loop so it can handle multi-char
 // Extracted so CommandCallbacks::onWrite() (phone app) and loop() (instructor override control) share one implementation.
 void handleCommand(char cmd) {
   switch (cmd) {
@@ -817,14 +828,6 @@ bool connectSensors(bool isReconnect) {
   }
   return false;
 }
-
-// void debugPrintSensors()
-// {
-//   Serial.print("sensors for...");
-//   Serial.print(targetSensorCount);
-//   for(int i = 0; i < targetSensorCount; i++)
-//     Serial.print(sensors[i].client->getPeerAddress().toString().c_str());
-// }
 
 // --------------------------------------------------
 // Sort Sensors - ensures Muscle Sensors detected in
