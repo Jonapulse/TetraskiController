@@ -44,9 +44,13 @@ volatile bool sensorDisconnectFlagged = false;
 #define RECONNECT_FREQ 10000 //10 seconds
 
 //Sensitivities
-const uint8_t sensitivityLevels[3] = { 20, 50, 80 };
+//Continuous sensitivity setting: incoming raw value is 0-99, mapped onto
+//[SENSITIVITY_MIN, SENSITIVITY_MAX] as the threshold offset above baseline average.
+#define SENSITIVITY_MIN 5
+#define SENSITIVITY_MAX 110
+#define SENSITIVITY_STEPS 99
 uint16_t sensorThresholds[MAX_SENSOR_COUNT];
-uint8_t sensitivityIndices[MAX_SENSOR_COUNT] = { 1, 1, 1, 1 };  
+uint8_t sensitivityValues[MAX_SENSOR_COUNT] = { 50, 50, 50, 50 };  //raw 0-99 setting per sensor, for config handshake
 
 //Directions
 int sensorOutputs[MAX_SENSOR_COUNT] = { 1, 2, 3, 4 };  //1 - left, 2 - right, FOR targetSensorCount > 2: 3 - wedge in, 4 - wedge out
@@ -160,10 +164,10 @@ class PhoneServerCallbacks : public NimBLEServerCallbacks {
     uint8_t configPayload[6] = {
       (uint8_t)targetSensorCount,
       invFlags,
-      sensitivityIndices[0],
-      sensitivityIndices[1],
-      sensitivityIndices[2],
-      sensitivityIndices[3]
+      sensitivityValues[0],
+      sensitivityValues[1],
+      sensitivityValues[2],
+      sensitivityValues[3]
     };
     pConfigChar->setValue(configPayload, 6);
     pConfigChar->notify();
@@ -256,8 +260,8 @@ void saveSettings() {
     snprintf(key, sizeof(key), "thresh%d", i);
     prefs.putUShort(key, sensorThresholds[i]);
 
-    snprintf(key, sizeof(key), "sensIdx%d", i);  //persist sensitivity index for config handshake
-    prefs.putUChar(key, sensitivityIndices[i]);
+    snprintf(key, sizeof(key), "sensIdx%d", i);  //persist raw 0-99 sensitivity value for config handshake
+    prefs.putUChar(key, sensitivityValues[i]);
 
     snprintf(key, sizeof(key), "ave%d", i);
     prefs.putUShort(key, sensorAverages[i]);
@@ -328,8 +332,8 @@ bool loadAndMatchSettings() {
       char key[8];
       snprintf(key, sizeof(key), "thresh%d", i);
       sensorThresholds[i] = prefs.getUShort(key, 0);
-      snprintf(key, sizeof(key), "sensIdx%d", i);  //restore sensitivity index
-      sensitivityIndices[i] = prefs.getUChar(key, 1);
+      snprintf(key, sizeof(key), "sensIdx%d", i);  //restore raw 0-99 sensitivity value
+      sensitivityValues[i] = prefs.getUChar(key, 50);
       snprintf(key, sizeof(key), "ave%d", i);
       sensorAverages[i] = prefs.getUShort(key, 0);
     }
@@ -544,12 +548,44 @@ void readAndPrintSensors()
 // 'w' - enter wifi pairing
 // '5' - calibrate sensors
 // 'c'/'f' - confirmation bytes for control change and calibration
-// '0','1','2'/'6','7','8'/'i','j','k'/'l','m','n' - sensitivity for sensors 0,1,2,3
+// 'l'/'r'/'u'/'d' + two ASCII digits (00-99) - continuous sensitivity for
+//     sensors 0/1/2/3 (left/right/up/down). E.g. "l50" sets sensor 0 to 50.
 // '3','4'/'g','h' - set 'left','right'/'wedge in','wedge out' sensors to standard or inverted controls
 // 'o'/'p' - set sensor count to '2'/'4'.
 // --------------------------------------------------
 // Extracted so CommandCallbacks::onWrite() (phone app) and loop() (instructor override control) share one implementation.
+
+// State machine for the 3-byte sensitivity command, since its bytes can arrive
+// across separate handleCommand() calls (one Serial byte is read per loop() iteration).
+enum SensCmdState { SENS_CMD_IDLE,
+                     SENS_CMD_WAIT_DIGIT1,
+                     SENS_CMD_WAIT_DIGIT2 };
+SensCmdState sensCmdState = SENS_CMD_IDLE;
+uint8_t sensCmdSensorIndex = 0;
+uint8_t sensCmdDigit1 = 0;
+
 void handleCommand(char cmd) {
+
+  // Continue parsing a pending sensitivity command if one is in progress.
+  // A non-digit byte where a digit is expected aborts the partial command;
+  // that byte then falls through to be processed as a normal command below.
+  if (sensCmdState == SENS_CMD_WAIT_DIGIT1) {
+    if (cmd >= '0' && cmd <= '9') {
+      sensCmdDigit1 = cmd - '0';
+      sensCmdState = SENS_CMD_WAIT_DIGIT2;
+      return;
+    }
+    sensCmdState = SENS_CMD_IDLE;
+  } else if (sensCmdState == SENS_CMD_WAIT_DIGIT2) {
+    if (cmd >= '0' && cmd <= '9') {
+      uint8_t rawValue = sensCmdDigit1 * 10 + (cmd - '0');
+      applySensitivity(sensCmdSensorIndex, rawValue);
+      sensCmdState = SENS_CMD_IDLE;
+      return;
+    }
+    sensCmdState = SENS_CMD_IDLE;
+  }
+
   switch (cmd) {
 
     case 'w':
@@ -563,17 +599,24 @@ void handleCommand(char cmd) {
       enterWifiOTA();
       break;
 
-    case '0':
-    case '1':
-    case '2':
-      setSensitivityBySensor(0, sensitivityLevels[cmd - '0']);
-      sensitivityIndices[0] = cmd - '0';  //track index for config handshake
-      if (COMMS) {
-        Serial.print("\nSensitivity for sensor 0 set to ");
-        Serial.println(sensitivityLevels[cmd - '0']);
-      }
-      Serial.print('c');
-      saveSettings();  
+    case 'l':
+      sensCmdSensorIndex = 0;
+      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      break;
+
+    case 'r':
+      sensCmdSensorIndex = 1;
+      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      break;
+
+    case 'u':
+      sensCmdSensorIndex = 2;
+      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      break;
+
+    case 'd':
+      sensCmdSensorIndex = 3;
+      sensCmdState = SENS_CMD_WAIT_DIGIT1;
       break;
 
     case '3':
@@ -597,19 +640,6 @@ void handleCommand(char cmd) {
       Serial.print('f');
       break;
 
-    case '6':
-    case '7':
-    case '8':
-      setSensitivityBySensor(1, sensitivityLevels[cmd - '6']);
-      sensitivityIndices[1] = cmd - '6';  
-      if (COMMS) {
-        Serial.print("\nSensitivity for sensor 1 set to ");
-        Serial.println(sensitivityLevels[cmd - '6']);
-      }
-      Serial.print('c');
-      saveSettings();  
-      break;
-
     case 'g':
       sensorOutputs[2] = 3;
       sensorOutputs[3] = 4;
@@ -620,32 +650,6 @@ void handleCommand(char cmd) {
     case 'h':
       sensorOutputs[2] = 4;
       sensorOutputs[3] = 3;
-      Serial.print('c');
-      saveSettings();  
-      break;
-
-    case 'i':
-    case 'j':
-    case 'k':
-      setSensitivityBySensor(2, sensitivityLevels[cmd - 'i']);
-      sensitivityIndices[2] = cmd - 'i';  
-      if (COMMS) {
-        Serial.print("\nSensitivity for sensor 2 set to ");
-        Serial.println(sensitivityLevels[cmd - 'i']);
-      }
-      Serial.print('c');
-      saveSettings();
-      break;
-
-    case 'l':
-    case 'm':
-    case 'n':
-      setSensitivityBySensor(3, sensitivityLevels[cmd - 'l']);
-      sensitivityIndices[3] = cmd - 'l'; 
-      if (COMMS) {
-        Serial.print("\nSensitivity for sensor 3 set to ");
-        Serial.println(sensitivityLevels[cmd - 'l']);
-      }
       Serial.print('c');
       saveSettings();  
       break;
@@ -893,6 +897,36 @@ void setSensitivityBySensor(uint16_t sensor, uint16_t value) {
 }
 
 // --------------------------------------------------
+// Map a raw 0-99 sensitivity setting onto [SENSITIVITY_MIN, SENSITIVITY_MAX],
+// rounded to the nearest integer threshold offset.
+// --------------------------------------------------
+uint16_t computeSensitivityOffset(uint8_t rawValue) {
+  float sensitivity = SENSITIVITY_MIN + (rawValue / (float)SENSITIVITY_STEPS) * (SENSITIVITY_MAX - SENSITIVITY_MIN);
+  return (uint16_t)(sensitivity + 0.5f);  //round to nearest integer
+}
+
+// --------------------------------------------------
+// Apply a continuous 0-99 sensitivity setting to a sensor in response to a
+// serial/BLE command: updates the threshold, stores the raw value (for
+// config handshake / NVS), sends the confirmation byte, and persists.
+// --------------------------------------------------
+void applySensitivity(uint8_t sensorIndex, uint8_t rawValue) {
+  uint16_t sensOffset = computeSensitivityOffset(rawValue);
+  setSensitivityBySensor(sensorIndex, sensOffset);
+  sensitivityValues[sensorIndex] = rawValue;
+
+  if (COMMS) {
+    Serial.print("\nSensitivity for sensor ");
+    Serial.print(sensorIndex);
+    Serial.print(" set to ");
+    Serial.println(sensOffset);
+  }
+
+  Serial.print('c');  //send confirmation byte to TetraSki
+  saveSettings();
+}
+
+// --------------------------------------------------
 // Calibrate sensors to baseline
 // --------------------------------------------------
 void calibrateThreshold() {
@@ -924,7 +958,9 @@ void calibrateThreshold() {
   }
 
   for (int i = 0; i < targetSensorCount; i++) {
-    setSensitivityBySensor(i, sensitivityLevels[1]);
+    //default to mid-point sensitivity on fresh calibration
+    setSensitivityBySensor(i, computeSensitivityOffset(50));
+    sensitivityValues[i] = 50;
   }
 }
 
