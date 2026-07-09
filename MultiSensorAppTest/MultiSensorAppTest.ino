@@ -164,29 +164,36 @@ void handleCommand(char cmd);
 void scanAndConnectSensors(bool isReconnect = false); //Arduino's pre-compiler was failing to auto-generate these when arguments were added
 bool connectSensors(bool isReconnect = false);
 
+// Send current settings to phone so app displays correct state on connect.
+// Byte layout: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
+// inversionFlags bit 0 = pair 0 inverted (sensorOutputs[0]==2)
+//                bit 1 = pair 1 inverted (sensorOutputs[2]==4)
+// NOTE: must only be called after the phone has subscribed to pConfigChar
+// (i.e. from onSubscribe), not from onConnect — notify() called before the
+// client writes the CCCD has no subscriber to deliver to and is silently dropped.
+void sendConfigToPhone() {
+  uint8_t invFlags = 0;
+  if (sensorOutputs[0] == 2) invFlags |= 0x01;
+  if (sensorOutputs[2] == 4) invFlags |= 0x02;
+  uint8_t configPayload[6] = {
+    (uint8_t)targetSensorCount,
+    invFlags,
+    sensitivityValues[0],
+    sensitivityValues[1],
+    sensitivityValues[2],
+    sensitivityValues[3]
+  };
+  pConfigChar->setValue(configPayload, 6);
+  pConfigChar->notify();
+}
+
 // NimBLE server callbacks — track phone connect/disconnect
 class PhoneServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  
     phoneConnected = true;
     if (COMMS) Serial.println("Phone connected");
-    
-    // Send current settings to phone so app displays correct state on connect.
-    // Byte layout: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
-    // inversionFlags bit 0 = pair 0 inverted (sensorOutputs[0]==2)
-    //                bit 1 = pair 1 inverted (sensorOutputs[2]==4)
-    uint8_t invFlags = 0;
-    if (sensorOutputs[0] == 2) invFlags |= 0x01;
-    if (sensorOutputs[2] == 4) invFlags |= 0x02;
-    uint8_t configPayload[6] = {
-      (uint8_t)targetSensorCount,
-      invFlags,
-      sensitivityValues[0],
-      sensitivityValues[1],
-      sensitivityValues[2],
-      sensitivityValues[3]
-    };
-    pConfigChar->setValue(configPayload, 6);
-    pConfigChar->notify();
+    // Config packet is sent from ConfigCallbacks::onSubscribe() instead of here —
+    // see note on sendConfigToPhone().
   }
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override { 
     phoneConnected = false;
@@ -202,6 +209,17 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
     if (val.length() > 0) {
       handleCommand((char)val[0]);
     }
+  }
+};
+
+// NimBLE characteristic callbacks for the config characteristic — fires once
+// the phone actually enables notifications (writes the CCCD), which is the
+// earliest point we're guaranteed the notify() below will be delivered.
+class ConfigCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo, uint16_t subValue) override {
+    if (subValue == 0) return;  // client unsubscribed — nothing to send
+    if (COMMS) Serial.println("Phone subscribed to config — sending initial settings");
+    sendConfigToPhone();
   }
 };
 
@@ -230,11 +248,12 @@ void setupPhonePeripheral() {
   );
   pCommandChar->setCallbacks(new CommandCallbacks());
 
-  // Config: NOTIFY — pushed once when phone connects to sync app display state
+  // Config: NOTIFY — pushed once when phone subscribes, to sync app display state
   pConfigChar = pService->createCharacteristic(
     CONFIG_CHAR_UUID,
     NIMBLE_PROPERTY::NOTIFY
   );
+  pConfigChar->setCallbacks(new ConfigCallbacks());
 
   pService->start();
 
@@ -442,6 +461,15 @@ void loop() {
 // --------------------------------------------------
 void readAndPrintSensors()
 {
+  // if(newValueReady[0] || newValueReady[1] || newValueReady[2] || newValueReady[3]){
+  //   Serial.print("NewValueReady: [");
+  //   Serial.print(newValueReady[0]);
+  //   Serial.print(newValueReady[1]);
+  //   Serial.print(newValueReady[2]);
+  //   Serial.print(newValueReady[3]);
+  //   Serial.println("]");
+  // }
+
   //Iterate over sensors by pair
   for (int i = 0; i < targetSensorCount; i += 2) {
     if (newValueReady[i] && newValueReady[i + 1]) {
