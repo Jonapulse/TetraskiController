@@ -6,7 +6,7 @@
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
-#define DEFAULT_SENSOR_COUNT 4  
+#define DEFAULT_SENSOR_COUNT 2  
 #define MAX_SENSOR_COUNT 4
 
 /************ WiFi OTA Stuff **************************************************/
@@ -33,7 +33,7 @@ struct SensorBLE {
 };
 
 SensorBLE sensors[MAX_SENSOR_COUNT];
-int targetSensorCount = MAX_SENSOR_COUNT;
+int targetSensorCount = DEFAULT_SENSOR_COUNT;
 int connectedSensorCount = 0;
 
 volatile uint16_t latestAnalogValues[MAX_SENSOR_COUNT] = { 0 };
@@ -66,6 +66,7 @@ const int SIZE_OF_AVE = 200;
 #define BUFFER_SIZE 20  //data transmission @ 10 Hz for 2 sec
 uint16_t sensorBuffers[MAX_SENSOR_COUNT][BUFFER_SIZE];
 
+bool intentionalDisconnect[MAX_SENSOR_COUNT] = { false }; //Flags for disconnecting sensors when switchning 4 -> 2
 
 // --------------------------------------------------
 // We're using this asynchronous NotifyCallback approach to reading data from sensors rather than 
@@ -116,6 +117,21 @@ NotifyCallback notifyCallbacks[4] = {
 
 class SensorClientCallbacks : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient* pClient, int reason) override {
+
+    // Figure out which slot this client belongs to
+    int slot = -1;
+    for (int i = 0; i < MAX_SENSOR_COUNT; i++) {
+      if (sensors[i].client == pClient) { slot = i; break; }
+    }
+
+    if (slot != -1 && intentionalDisconnect[slot]) {
+      // We disconnected this one on purpose (e.g. dropping to 2-sensor mode) —
+      // not a hardware drop, so don't trigger reconnect logic.
+      intentionalDisconnect[slot] = false;
+      if (COMMS) Serial.println("Intentional disconnect, ignoring");
+      return;
+    }
+
     connectedSensorCount--;
     sensorDisconnectFlagged = true;
     if (COMMS) {
@@ -360,7 +376,7 @@ void setup() {
   setupPhonePeripheral();
 
   prefs.begin("tetra", true);
-  targetSensorCount = prefs.getInt("sensorCount", MAX_SENSOR_COUNT);
+  targetSensorCount = prefs.getInt("sensorCount", DEFAULT_SENSOR_COUNT);
   prefs.end();
 
   scanAndConnectSensors();
@@ -552,6 +568,7 @@ void readAndPrintSensors()
 //     sensors 0/1/2/3 (left/right/up/down). E.g. "l50" sets sensor 0 to 50.
 // '3','4'/'g','h' - set 'left','right'/'wedge in','wedge out' sensors to standard or inverted controls
 // 'o'/'p' - set sensor count to '2'/'4'.
+// 'z' - clear save. Intended for debug.
 // --------------------------------------------------
 // Extracted so CommandCallbacks::onWrite() (phone app) and loop() (instructor override control) share one implementation.
 
@@ -655,9 +672,14 @@ void handleCommand(char cmd) {
       break;
 
     case 'o':
+      for (int i = 2; i < MAX_SENSOR_COUNT; i++) {
+        if (sensors[i].client && sensors[i].client->isConnected()) {
+          intentionalDisconnect[i] = true;
+          sensors[i].client->disconnect();
+          connectedSensorCount--;
+        }
+      }
       targetSensorCount = 2;
-      if(connectedSensorCount > 2)
-        connectedSensorCount = 2;
       saveSettings(); 
       break;
 
@@ -665,7 +687,15 @@ void handleCommand(char cmd) {
       targetSensorCount = 4;
       saveSettings(); 
       if(connectedSensorCount < targetSensorCount)
-        scanAndConnectSensors();
+        scanAndConnectSensors(true); //reconnect = true boolean flagged so we don't resort the left/right sensor values
+      break;
+
+    case 'z':
+      prefs.begin("tetra", false);  // false = read/write
+      prefs.clear();
+      prefs.end();
+      if (COMMS) Serial.println("NVS settings cleared");
+      Serial.print('c');  // confirmation byte to TetraSki
       break;
   }
 }
@@ -676,12 +706,17 @@ void handleCommand(char cmd) {
 // sensors are placed directly into their saved MAC slots.
 // --------------------------------------------------
 bool connectSensors(bool isReconnect) {
-  if (COMMS) Serial.println("Scanning for sensors...");
+  if (COMMS) {
+    Serial.print("Scanning for sensors... Target num: ");
+    Serial.println(targetSensorCount);
+  }
 
   NimBLEScan* pScan = NimBLEDevice::getScan();
   pScan->setActiveScan(true);
 
   long scanStart = millis();
+
+  if(COMMS)
 
   while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
 
@@ -740,6 +775,12 @@ bool connectSensors(bool isReconnect) {
         }
 
         SensorBLE& sensor = sensors[targetSlot];
+
+        // Free any stale client object left over from a previous disconnect
+        if (sensor.client) {
+          NimBLEDevice::deleteClient(sensor.client);
+          sensor.client = nullptr;
+        }
 
         sensor.client = NimBLEDevice::createClient();
         if (!sensor.client) {
