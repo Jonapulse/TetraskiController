@@ -3,6 +3,7 @@
 #include <ArduinoOTA.h>
 #include "NimBLEDevice.h"
 #include <Preferences.h>  
+#include "Secrets.h"  // WiFi/OTA credentials — NOT committed to git. See Secrets.h.example.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
@@ -10,8 +11,8 @@
 #define MAX_SENSOR_COUNT 4
 
 /************ WiFi OTA Stuff **************************************************/
-const char* ssid = "TetraOTA";
-const char* password = "tetra2034";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 bool OTAUpdateEnable = 0;
 
 /************ BLE Sensor Stuff ************************************************/
@@ -1066,7 +1067,7 @@ void enterWifiOTA() {
   // ... (other OTA callbacks)
 
   ArduinoOTA.begin();
-  ArduinoOTA.setPassword("test");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
   if (COMMS) Serial.println("Ready");
   if (COMMS) Serial.print("IP address: ");
   if (COMMS) Serial.println(WiFi.localIP());
