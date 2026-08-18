@@ -4,17 +4,17 @@
 #include "NimBLEDevice.h"
 #include <Preferences.h>  
 #include "Secrets.h"  // WiFi/OTA credentials — NOT committed to git. See Secrets.h.example.
+#include <freertos/queue.h>
+
+QueueHandle_t commandQueue; //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
 #define DEFAULT_SENSOR_COUNT 2  
 #define MAX_SENSOR_COUNT 4
 
-// Set to 0 to build without the phone/app support in PhonePeripheral.ino —
-// e.g. a bare radio that only talks to TetraSki over serial. All references
-// to phone-side code in this file are wrapped in #if ENABLE_PHONE_PERIPHERAL
-// blocks. To fully remove phone support: set this to 0 AND remove/comment
-// out the PhonePeripheral.ino tab (its contents aren't otherwise guarded).
+// Setting to 0 will strip phone broadcasting and interaction. 
+// Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
 #define ENABLE_PHONE_PERIPHERAL 1
 
 /************ WiFi OTA Stuff **************************************************/
@@ -80,12 +80,7 @@ bool intentionalDisconnect[MAX_SENSOR_COUNT] = { false }; //Flags for disconnect
 // We're using this asynchronous NotifyCallback approach to reading data from sensors rather than 
 // the sequential sensor.readValue() approach which must wait for each sensor to call/respond in order  
 // --------------------------------------------------
-// notification callback - called by NimBLE stack when sensor pushes a new value
-// pData contains raw bytes, length should be 2 for a uint16_t analog value
-// sensorIndex identifies which sensor triggered this callback
 void makeNotifyCallback(int sensorIndex) {
-  // Returns a lambda capturing sensorIndex, used when subscribing each sensor
-  // Called on BLE stack thread - only write to volatiles, no Serial or BLE calls here
 }
 
 // actual notification callback function, one per sensor slot
@@ -150,25 +145,12 @@ class SensorClientCallbacks : public NimBLEClientCallbacks {
 };
 SensorClientCallbacks sensorClientCallbacks;
 
-
-// The NimBLE PERIPHERAL role (advertising as "TetraRadio", serving sensor
-// data/battery/config to the phone app) lives in PhonePeripheral.ino, another
-// tab in this same sketch. handleCommand() stays here in the main file since
-// it also handles serial commands from TetraSki directly, independent of
-// whether a phone is connected — see ENABLE_PHONE_PERIPHERAL below.
-
 // Forward declarations — Arduino's pre-compiler fails to auto-generate these
 // when default arguments are involved, so they're declared explicitly here.
 void scanAndConnectSensors(bool isReconnect = false);
 bool connectSensors(bool isReconnect = false);
 
 #if ENABLE_PHONE_PERIPHERAL
-// phoneConnected / pSensorDataChar / pBatteryDataChar are defined in
-// PhonePeripheral.ino, which is concatenated AFTER this file, but they're
-// used earlier in readAndPrintSensors() below. Arduino auto-generates
-// prototypes for functions but not for plain global variables, so these
-// need an explicit extern declaration or the compiler hits them before
-// it's seen a definition.
 extern bool phoneConnected;
 extern NimBLECharacteristic* pSensorDataChar;
 extern NimBLECharacteristic* pBatteryDataChar;
@@ -300,6 +282,10 @@ void setup() {
 
   NimBLEDevice::init("TetraRadio");
 
+  // Depth 16 so a burst of writes (e.g. a 3-byte sensitivity command arriving
+  // right after other traffic) can't overflow before loop() drains it.
+  commandQueue = xQueueCreate(16, sizeof(char));
+
 #if ENABLE_PHONE_PERIPHERAL
   setupPhonePeripheral();
 #endif
@@ -348,6 +334,11 @@ void loop() {
     handleCommand(incomingByte); 
   }
 
+  char cmd;
+  while (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+    handleCommand(cmd);
+  }
+
   readAndPrintSensors();
 
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
@@ -363,23 +354,11 @@ void loop() {
 // For convenience, also periodically (set to 5s) checks battery charge and updates 
 // sensor LEDs.
 // 
-// NOTE: slope calculation was added to give expected output in the common use-case where the 
-// user has been activating one sensor and changes to activate the other sensor. Commonly, both 
-// sensors will be active during this transition. Measuring the slope will let us respond with 
-// the sensor the user is moving towards much more quickly than waiting for the sensor they are 
-// moving away from to fully deactivate.
+// NOTE: slope calculation was added to speed up the intended control when a user relaxes one arm and flexes
+// the other. Without it, the new flex isn't registered until the relaxing arm comes to rest, 1-2 seconds after intended contorl.
 // --------------------------------------------------
 void readAndPrintSensors()
 {
-  // if(newValueReady[0] || newValueReady[1] || newValueReady[2] || newValueReady[3]){
-  //   Serial.print("NewValueReady: [");
-  //   Serial.print(newValueReady[0]);
-  //   Serial.print(newValueReady[1]);
-  //   Serial.print(newValueReady[2]);
-  //   Serial.print(newValueReady[3]);
-  //   Serial.println("]");
-  // }
-
   //Iterate over sensors by pair
   for (int i = 0; i < targetSensorCount; i += 2) {
     if (newValueReady[i] && newValueReady[i + 1]) {

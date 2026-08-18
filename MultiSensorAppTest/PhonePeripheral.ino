@@ -4,14 +4,6 @@
 // (running App.js) connects to this device as "TetraRadio" to view live
 // sensor data/battery and send config commands.
 //
-// This is one .ino tab within the same Arduino sketch as
-// MultiSensorAppTest.ino — Arduino concatenates all .ino files in a sketch
-// folder into a single translation unit before compiling, so everything
-// here shares global scope with the main file (sensors[], targetSensorCount,
-// COMMS, saveSettings(), calibrateThreshold(), enterWifiOTA(), etc. are all
-// still visible here without any include). This split is purely
-// organizational, not a real module boundary.
-//
 // The radio's CENTRAL role (scanning/connecting to the muscle sensors)
 // lives in MultiSensorAppTest.ino instead — see connectSensors(),
 // scanAndConnectSensors(), and the notify callbacks there.
@@ -43,10 +35,6 @@ NimBLECharacteristic* pBatteryDataChar   = nullptr;  // READ    — 4 bytes: [ba
 NimBLECharacteristic* pCommandChar       = nullptr;  // WRITE   — 1 byte command
 NimBLECharacteristic* pConfigChar        = nullptr;  // NOTIFY — 6 bytes: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
 bool phoneConnected = false;
-
-// NOTE: no forward declaration needed for handleCommand() here — it's
-// defined in MultiSensorAppTest.ino, which is concatenated ahead of this
-// file, so it's already visible below by the time CommandCallbacks uses it.
 
 // Send current settings to phone so app displays correct state on connect.
 // Byte layout: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
@@ -86,12 +74,19 @@ class PhoneServerCallbacks : public NimBLEServerCallbacks {
   }
 };
 
-// NimBLE characteristic callbacks — handle incoming command writes from phone
+// commandQueue is defined in MultiSensorAppTest.ino.
+extern QueueHandle_t commandQueue;
+
+// NimBLE characteristic callbacks — handle incoming command writes from phone.
+// Must never call handleCommand() directly: onWrite() runs on the NimBLE host
+// task, and blocking commands (calibration) would deadlock the BLE stack.
+// Enqueue non-blockingly instead and let loop() drain it on the main task.
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {  
     std::string val = pChar->getValue();
-    if (val.length() > 0) {
-      handleCommand((char)val[0]);
+    for (size_t i = 0; i < val.length(); i++) {
+      char c = val[i];
+      xQueueSend(commandQueue, &c, 0);
     }
   }
 };
