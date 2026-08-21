@@ -154,6 +154,8 @@ bool connectSensors(bool isReconnect = false);
 extern bool phoneConnected;
 extern NimBLECharacteristic* pSensorDataChar;
 extern NimBLECharacteristic* pBatteryDataChar;
+extern NimBLEServer* pPhoneServer;
+extern uint16_t phoneConnHandle;
 #endif
 
 
@@ -490,6 +492,7 @@ void readAndPrintSensors()
 // '3','4'/'g','h' - set 'left','right'/'wedge in','wedge out' sensors to standard or inverted controls
 // 'o'/'p' - set sensor count to '2'/'4'.
 // 'z' - clear save. Intended for debug.
+// 'x' - phone disconnect - handled here to make sure esp32 disconnects and goes back to advertising itself
 // --------------------------------------------------
 // Extracted so CommandCallbacks::onWrite() (phone app) and loop() (instructor override control) share one implementation.
 
@@ -611,6 +614,13 @@ void handleCommand(char cmd) {
         scanAndConnectSensors(true); //reconnect = true boolean flagged so we don't resort the left/right sensor values
       break;
 
+    case 'x': 
+      #if ENABLE_PHONE_PERIPHERAL
+      if (phoneConnected) {
+        pPhoneServer->disconnect(phoneConnHandle);
+      }
+      #endif
+      break;
     case 'z':
       prefs.begin("tetra", false);  // false = read/write
       prefs.clear();

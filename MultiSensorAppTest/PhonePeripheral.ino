@@ -35,6 +35,7 @@ NimBLECharacteristic* pBatteryDataChar   = nullptr;  // READ    — 4 bytes: [ba
 NimBLECharacteristic* pCommandChar       = nullptr;  // WRITE   — 1 byte command
 NimBLECharacteristic* pConfigChar        = nullptr;  // NOTIFY — 6 bytes: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
 bool phoneConnected = false;
+uint16_t phoneConnHandle = BLE_HS_CONN_HANDLE_NONE;
 
 // Send current settings to phone so app displays correct state on connect.
 // Byte layout: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
@@ -63,12 +64,14 @@ void sendConfigToPhone() {
 class PhoneServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {  
     phoneConnected = true;
+    phoneConnHandle = connInfo.getConnHandle();
     if (COMMS) Serial.println("Phone connected");
     // Config packet is sent from ConfigCallbacks::onSubscribe() instead of here —
     // see note on sendConfigToPhone().
   }
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override { 
     phoneConnected = false;
+    phoneConnHandle = BLE_HS_CONN_HANDLE_NONE;
     if (COMMS) Serial.println("Phone disconnected — restarting advertising");
     NimBLEDevice::startAdvertising();  // auto-restart so phone can reconnect
   }
