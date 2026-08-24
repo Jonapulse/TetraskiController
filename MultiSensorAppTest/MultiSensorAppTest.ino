@@ -2,18 +2,18 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include "NimBLEDevice.h"
-#include <Preferences.h>  
+#include <Preferences.h>
 #include "Secrets.h"  // WiFi/OTA credentials — NOT committed to git. See Secrets.h.example.
 #include <freertos/queue.h>
 
-QueueHandle_t commandQueue; //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
+QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
 #define COMMS 1
-#define DEFAULT_SENSOR_COUNT 2  
+#define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
-// Setting to 0 will strip phone broadcasting and interaction. 
+// Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
 #define ENABLE_PHONE_PERIPHERAL 1
 
@@ -49,7 +49,7 @@ volatile bool newValueReady[MAX_SENSOR_COUNT] = { false };
 
 volatile bool sensorDisconnectFlagged = false;
 
-#define RECONNECT_FREQ 10000 //10 seconds
+#define RECONNECT_FREQ 10000  //10 seconds
 
 //Sensitivities
 //Continuous sensitivity setting: incoming raw value is 0-99, mapped onto
@@ -64,8 +64,8 @@ uint8_t sensitivityValues[MAX_SENSOR_COUNT] = { 50, 50, 50, 50 };  //raw 0-99 se
 int sensorOutputs[MAX_SENSOR_COUNT] = { 1, 2, 3, 4 };  //1 - left, 2 - right, FOR targetSensorCount > 2: 3 - wedge in, 4 - wedge out
 int idle = 0;
 
-#define BATTERY_UPDATE_FREQ 5000 //5 seconds
-#define WEDGE_OUTPUT_FREQ 500 //0.5 seconds
+#define BATTERY_UPDATE_FREQ 5000  //5 seconds
+#define WEDGE_OUTPUT_FREQ 500     //0.5 seconds
 long lastWedgeActivation = 0;
 
 uint16_t sensorAverages[MAX_SENSOR_COUNT];
@@ -74,11 +74,11 @@ const int SIZE_OF_AVE = 200;
 #define BUFFER_SIZE 20  //data transmission @ 10 Hz for 2 sec
 uint16_t sensorBuffers[MAX_SENSOR_COUNT][BUFFER_SIZE];
 
-bool intentionalDisconnect[MAX_SENSOR_COUNT] = { false }; //Flags for disconnecting sensors when switchning 4 -> 2
+bool intentionalDisconnect[MAX_SENSOR_COUNT] = { false };  //Flags for disconnecting sensors when switchning 4 -> 2
 
 // --------------------------------------------------
-// We're using this asynchronous NotifyCallback approach to reading data from sensors rather than 
-// the sequential sensor.readValue() approach which must wait for each sensor to call/respond in order  
+// We're using this asynchronous NotifyCallback approach to reading data from sensors rather than
+// the sequential sensor.readValue() approach which must wait for each sensor to call/respond in order
 // --------------------------------------------------
 void makeNotifyCallback(int sensorIndex) {
 }
@@ -124,7 +124,10 @@ class SensorClientCallbacks : public NimBLEClientCallbacks {
     // Figure out which slot this client belongs to
     int slot = -1;
     for (int i = 0; i < MAX_SENSOR_COUNT; i++) {
-      if (sensors[i].client == pClient) { slot = i; break; }
+      if (sensors[i].client == pClient) {
+        slot = i;
+        break;
+      }
     }
 
     if (slot != -1 && intentionalDisconnect[slot]) {
@@ -207,7 +210,7 @@ void saveSettings() {
 // Returns true if every sensor slot relevant to the current targetSensorCount
 // matches a saved MAC. On true, restores thresholds, averages, and outputs
 // for those slots so calibration can be skipped.
-// NOTE: Save stores data for up to 4 sensors. For 2 sensor setting, higher sensor 
+// NOTE: Save stores data for up to 4 sensors. For 2 sensor setting, higher sensor
 // data is not saved or read but remains present.
 bool loadAndMatchSettings() {
   prefs.begin("tetra", true);  // true = read-only
@@ -236,8 +239,8 @@ bool loadAndMatchSettings() {
     snprintf(key, sizeof(key), "mac%d", i);
     String savedMAC = prefs.getString(key, "");
     String currentMAC = sensors[i].client
-      ? String(sensors[i].client->getPeerAddress().toString().c_str())
-      : String("");
+                          ? String(sensors[i].client->getPeerAddress().toString().c_str())
+                          : String("");
 
     if (savedMAC == "" || savedMAC != currentMAC) {
       if (COMMS) {
@@ -299,8 +302,7 @@ void setup() {
   scanAndConnectSensors();
 }
 
-void scanAndConnectSensors(bool isReconnect)
-{
+void scanAndConnectSensors(bool isReconnect) {
   while (1) {  //Enter connection loop
 
     //attempt to connect again until connection established
@@ -333,7 +335,7 @@ void loop() {
   //check for incoming comms from TetraSki
   if (Serial.available()) {
     char incomingByte = Serial.read();
-    handleCommand(incomingByte); 
+    handleCommand(incomingByte);
   }
 
   char cmd;
@@ -353,20 +355,19 @@ void loop() {
 // --------------------------------------------------
 // readAndPrintSensors -
 // Reads sensor pair (or pairs for 4 sensor setting) and prints output
-// For convenience, also periodically (set to 5s) checks battery charge and updates 
+// For convenience, also periodically (5s) checks battery charge and updates
 // sensor LEDs.
-// 
+//
 // NOTE: slope calculation was added to speed up the intended control when a user relaxes one arm and flexes
 // the other. Without it, the new flex isn't registered until the relaxing arm comes to rest, 1-2 seconds after intended contorl.
 // --------------------------------------------------
-void readAndPrintSensors()
-{
+void readAndPrintSensors() {
   //Iterate over sensors by pair
   for (int i = 0; i < targetSensorCount; i += 2) {
     if (newValueReady[i] && newValueReady[i + 1]) {
       uint16_t valA = latestAnalogValues[i];
       uint16_t valB = latestAnalogValues[i + 1];
-      newValueReady[i] = false;  
+      newValueReady[i] = false;
       newValueReady[i + 1] = false;
 
       //update buffer
@@ -399,13 +400,12 @@ void readAndPrintSensors()
 
       //output direction over serial to TetraSki
       //Special case 2nd pair - 0.5s cooldown on use
-      if(i == 2){
-        if(millis() - lastWedgeActivation > WEDGE_OUTPUT_FREQ && currentDirection > 0){
+      if (i == 2) {
+        if (millis() - lastWedgeActivation > WEDGE_OUTPUT_FREQ && currentDirection > 0) {
           lastWedgeActivation = millis();
           Serial.print(currentDirection);
         }
-      }
-      else {
+      } else {
         Serial.print(currentDirection);
       }
 
@@ -418,64 +418,64 @@ void readAndPrintSensors()
       //   [6-7]   valA (sensor 2) big-endian — 0 in 2-sensor mode
       //   [8-9]   valB (sensor 3) big-endian — 0 in 2-sensor mode
 #if ENABLE_PHONE_PERIPHERAL
-      if (phoneConnected && i == 0) {
-        // Preserve whatever pair 1 last wrote into bytes 5-9 instead of
+      if (phoneConnected) {
+        if (i == 0) {
+          // Preserve whatever pair 1 last wrote into bytes 5-9 instead of
         // zeroing them — otherwise every pair-0 update stomps pair-1 data.
-        uint8_t payload[10] = { 0 };
-        std::string existing = pSensorDataChar->getValue();
-        if (existing.length() == 10) {
-          memcpy(payload + 5, existing.data() + 5, 5);
-        }
-        payload[0] = (uint8_t)currentDirection;
-        payload[1] = (uint8_t)(valA >> 8);
-        payload[2] = (uint8_t)(valA & 0xFF);
-        payload[3] = (uint8_t)(valB >> 8);
-        payload[4] = (uint8_t)(valB & 0xFF);
-        pSensorDataChar->setValue(payload, 10);
-        pSensorDataChar->notify();
-
-        // Read and broadcast battery levels periodically
-        static unsigned long lastBattUpdate = 0;
-        if (millis() - lastBattUpdate > BATTERY_UPDATE_FREQ) {  // every 5 seconds
-          lastBattUpdate = millis();
-          uint8_t battLevels[4] = { 0, 0, 0, 0 };
-          int activeSensors = (targetSensorCount == 4) ? 4 : 2;
-          for (int s = 0; s < activeSensors; s++) {
-            std::string battVal = sensors[s].batteryChar->readValue();
-            if (battVal.length() > 0) battLevels[s] = (uint8_t)battVal[0];
+          uint8_t payload[10] = { 0 };
+          std::string existing = pSensorDataChar->getValue();
+          if (existing.length() == 10) {
+            memcpy(payload + 5, existing.data() + 5, 5);
           }
-          pBatteryDataChar->setValue(battLevels, 4);
-
-          //update sensor LED color based on battery level after each periodic read
-          // >66% -> 6 (green-green), >33% -> 7 (green-red), else -> 11 (red-red)
-          for (int s = 0; s < activeSensors; s++) {
-            uint8_t ledCode;
-            if (battLevels[s] > 66)      ledCode = 6;
-            else if (battLevels[s] > 33) ledCode = 7;
-            else                          ledCode = 11;
-            sensors[s].digitalChar->writeValue(&ledCode, 1);
-          }
-        }
-      }
-#endif  // ENABLE_PHONE_PERIPHERAL
-#if ENABLE_PHONE_PERIPHERAL
-      if (phoneConnected && i == 2) {
-        // Patch pair 1 data into bytes 5-9 and notify directly — wedge-only
-        // updates must not wait for the next pair-0 cycle to reach the phone.
-        std::string current = pSensorDataChar->getValue();
-        if (current.length() == 10) {
-          uint8_t payload[10];
-          memcpy(payload, current.data(), 10);
-          payload[5] = (uint8_t)currentDirection;
-          payload[6] = (uint8_t)(valA >> 8);
-          payload[7] = (uint8_t)(valA & 0xFF);
-          payload[8] = (uint8_t)(valB >> 8);
-          payload[9] = (uint8_t)(valB & 0xFF);
+          payload[0] = (uint8_t)currentDirection;
+          payload[1] = (uint8_t)(valA >> 8);
+          payload[2] = (uint8_t)(valA & 0xFF);
+          payload[3] = (uint8_t)(valB >> 8);
+          payload[4] = (uint8_t)(valB & 0xFF);
           pSensorDataChar->setValue(payload, 10);
           pSensorDataChar->notify();
+        } else if (i == 2) {
+          // Patch pair 1 data into bytes 5-9 and notify directly — wedge-only
+          // updates must not wait for the next pair-0 cycle to reach the phone.
+          std::string current = pSensorDataChar->getValue();
+          if (current.length() == 10) {
+            uint8_t payload[10];
+            memcpy(payload, current.data(), 10);
+            payload[5] = (uint8_t)currentDirection;
+            payload[6] = (uint8_t)(valA >> 8);
+            payload[7] = (uint8_t)(valA & 0xFF);
+            payload[8] = (uint8_t)(valB >> 8);
+            payload[9] = (uint8_t)(valB & 0xFF);
+            pSensorDataChar->setValue(payload, 10);
+            pSensorDataChar->notify();
+          }
         }
       }
 #endif  // ENABLE_PHONE_PERIPHERAL
+    }
+  }
+  // Read and broadcast battery levels periodically
+  static unsigned long lastBattUpdate = 0;
+  if (millis() - lastBattUpdate > BATTERY_UPDATE_FREQ) {  // every 5 seconds
+    lastBattUpdate = millis();
+    uint8_t battLevels[4] = { 0, 0, 0, 0 };
+    int activeSensors = (targetSensorCount == 4) ? 4 : 2;
+    for (int s = 0; s < activeSensors; s++) {
+      std::string battVal = sensors[s].batteryChar->readValue();
+      if (battVal.length() > 0) battLevels[s] = (uint8_t)battVal[0];
+    }
+#if ENABLE_PHONE_PERIPHERAL
+    pBatteryDataChar->setValue(battLevels, 4);
+#endif
+
+    //update sensor LED color based on battery level after each periodic read
+    // >66% -> 6 (green-green), >33% -> 7 (green-red), else -> 11 (red-red)
+    for (int s = 0; s < activeSensors; s++) {
+      uint8_t ledCode;
+      if (battLevels[s] > 66) ledCode = 6;
+      else if (battLevels[s] > 33) ledCode = 7;
+      else ledCode = 11;
+      sensors[s].digitalChar->writeValue(&ledCode, 1);
     }
   }
 }
@@ -499,8 +499,8 @@ void readAndPrintSensors()
 // State machine for the 3-byte sensitivity command, since its bytes can arrive
 // across separate handleCommand() calls (one Serial byte is read per loop() iteration).
 enum SensCmdState { SENS_CMD_IDLE,
-                     SENS_CMD_WAIT_DIGIT1,
-                     SENS_CMD_WAIT_DIGIT2 };
+                    SENS_CMD_WAIT_DIGIT1,
+                    SENS_CMD_WAIT_DIGIT2 };
 SensCmdState sensCmdState = SENS_CMD_IDLE;
 uint8_t sensCmdSensorIndex = 0;
 uint8_t sensCmdDigit1 = 0;
@@ -564,14 +564,14 @@ void handleCommand(char cmd) {
       sensorOutputs[0] = 1;
       sensorOutputs[1] = 2;
       Serial.print('c');
-      saveSettings(); 
+      saveSettings();
       break;
 
     case '4':
       sensorOutputs[0] = 2;
       sensorOutputs[1] = 1;
       Serial.print('c');
-      saveSettings(); 
+      saveSettings();
       break;
 
     case '5':
@@ -585,14 +585,14 @@ void handleCommand(char cmd) {
       sensorOutputs[2] = 3;
       sensorOutputs[3] = 4;
       Serial.print('c');
-      saveSettings();  
+      saveSettings();
       break;
 
     case 'h':
       sensorOutputs[2] = 4;
       sensorOutputs[3] = 3;
       Serial.print('c');
-      saveSettings();  
+      saveSettings();
       break;
 
     case 'o':
@@ -604,22 +604,22 @@ void handleCommand(char cmd) {
         }
       }
       targetSensorCount = 2;
-      saveSettings(); 
+      saveSettings();
       break;
 
     case 'p':
       targetSensorCount = 4;
-      saveSettings(); 
-      if(connectedSensorCount < targetSensorCount)
-        scanAndConnectSensors(true); //reconnect = true boolean flagged so we don't resort the left/right sensor values
+      saveSettings();
+      if (connectedSensorCount < targetSensorCount)
+        scanAndConnectSensors(true);  //reconnect = true boolean flagged so we don't resort the left/right sensor values
       break;
 
-    case 'x': 
-      #if ENABLE_PHONE_PERIPHERAL
+    case 'x':
+#if ENABLE_PHONE_PERIPHERAL
       if (phoneConnected) {
         pPhoneServer->disconnect(phoneConnHandle);
       }
-      #endif
+#endif
       break;
     case 'z':
       prefs.begin("tetra", false);  // false = read/write
@@ -648,143 +648,142 @@ bool connectSensors(bool isReconnect) {
 
   long scanStart = millis();
 
-  if(COMMS)
+  if (COMMS)
 
-  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
+    while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
 
-    NimBLEScanResults results = pScan->getResults(1000, false);
+      NimBLEScanResults results = pScan->getResults(1000, false);
 
-    for (int i = 0; i < results.getCount(); i++) {
-      const NimBLEAdvertisedDevice* device = results.getDevice(i);
-      std::string name = device->getName();
+      for (int i = 0; i < results.getCount(); i++) {
+        const NimBLEAdvertisedDevice* device = results.getDevice(i);
+        std::string name = device->getName();
 
-      if (COMMS) {
-        Serial.print("Found: ");
-        Serial.print(device->getAddress().toString().c_str());
-        Serial.print(" | Name: ");
-        Serial.println(name.c_str());
-      }
-
-      if (name == targetLocalName) {
         if (COMMS) {
-          Serial.print("Target found: ");
-          Serial.println(device->getAddress().toString().c_str());
+          Serial.print("Found: ");
+          Serial.print(device->getAddress().toString().c_str());
+          Serial.print(" | Name: ");
+          Serial.println(name.c_str());
         }
 
-        String foundMAC = String(device->getAddress().toString().c_str());
-
-        // Skip sensors that are already connected — avoids duplicate clients on reconnect
-        bool alreadyConnected = false;
-        for (int s = 0; s < targetSensorCount; s++) {
-          if (sensors[s].client && sensors[s].client->isConnected() &&
-              String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
-            if (COMMS) Serial.println("Already connected, skipping");
-            alreadyConnected = true;
-            break;
+        if (name == targetLocalName) {
+          if (COMMS) {
+            Serial.print("Target found: ");
+            Serial.println(device->getAddress().toString().c_str());
           }
-        }
-        if (alreadyConnected) continue;
 
-        // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
-        int targetSlot = connectedSensorCount;
-        for (int s = 0; s < targetSensorCount; s++) {
-          if (!sensors[s].client || !sensors[s].client->isConnected()) {
-            // Check if saved MAC for this slot matches
-            prefs.begin("tetra", true);
-            char key[8];
-            snprintf(key, sizeof(key), "mac%d", s);
-            String savedMAC = prefs.getString(key, "");
-            prefs.end();
-            if (savedMAC == foundMAC) {
-              targetSlot = s;
-              if (COMMS) {
-                Serial.print("Matched to saved slot ");
-                Serial.println(s);
-              }
+          String foundMAC = String(device->getAddress().toString().c_str());
+
+          // Skip sensors that are already connected — avoids duplicate clients on reconnect
+          bool alreadyConnected = false;
+          for (int s = 0; s < targetSensorCount; s++) {
+            if (sensors[s].client && sensors[s].client->isConnected() && String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
+              if (COMMS) Serial.println("Already connected, skipping");
+              alreadyConnected = true;
               break;
             }
           }
+          if (alreadyConnected) continue;
+
+          // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
+          int targetSlot = connectedSensorCount;
+          for (int s = 0; s < targetSensorCount; s++) {
+            if (!sensors[s].client || !sensors[s].client->isConnected()) {
+              // Check if saved MAC for this slot matches
+              prefs.begin("tetra", true);
+              char key[8];
+              snprintf(key, sizeof(key), "mac%d", s);
+              String savedMAC = prefs.getString(key, "");
+              prefs.end();
+              if (savedMAC == foundMAC) {
+                targetSlot = s;
+                if (COMMS) {
+                  Serial.print("Matched to saved slot ");
+                  Serial.println(s);
+                }
+                break;
+              }
+            }
+          }
+
+          SensorBLE& sensor = sensors[targetSlot];
+
+          // Free any stale client object left over from a previous disconnect
+          if (sensor.client) {
+            NimBLEDevice::deleteClient(sensor.client);
+            sensor.client = nullptr;
+          }
+
+          sensor.client = NimBLEDevice::createClient();
+          if (!sensor.client) {
+            if (COMMS) Serial.println("Client creation failed, skipping");
+            continue;
+          }
+
+          sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
+
+          if (!sensor.client->connect(device)) {
+            if (COMMS) Serial.println("Connection failed, skipping");
+            NimBLEDevice::deleteClient(sensor.client);
+            sensor.client = nullptr;
+            continue;
+          }
+
+          sensor.batteryService = sensor.client->getService(battServiceUUID);
+          if (!sensor.batteryService) {
+            if (COMMS) Serial.println("Battery service not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID);
+          if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
+            if (COMMS) Serial.println("Battery characteristic not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
+          if (!sensor.ioService) {
+            if (COMMS) Serial.println("IO service not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
+          if (!sensor.analogChar || !sensor.analogChar->canRead()) {
+            if (COMMS) Serial.println("Analog characteristic not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
+          if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
+            if (COMMS) Serial.println("Digital characteristic not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          // notifyCallbacks[] maps sensor index to its callback function
+          if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
+            if (COMMS) Serial.println("Notification subscription failed, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          if (COMMS) {
+            Serial.print("Sensor ");
+            Serial.print(targetSlot);
+            Serial.print(" connected and subscribed: ");
+            Serial.println(device->getAddress().toString().c_str());
+          }
+
+          connectedSensorCount++;
+
+          if (connectedSensorCount == targetSensorCount)
+            break;
         }
-
-        SensorBLE& sensor = sensors[targetSlot];
-
-        // Free any stale client object left over from a previous disconnect
-        if (sensor.client) {
-          NimBLEDevice::deleteClient(sensor.client);
-          sensor.client = nullptr;
-        }
-
-        sensor.client = NimBLEDevice::createClient();
-        if (!sensor.client) {
-          if (COMMS) Serial.println("Client creation failed, skipping");
-          continue;
-        }
-
-        sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
-
-        if (!sensor.client->connect(device)) {
-          if (COMMS) Serial.println("Connection failed, skipping");
-          NimBLEDevice::deleteClient(sensor.client);
-          sensor.client = nullptr;
-          continue;
-        }
-
-        sensor.batteryService = sensor.client->getService(battServiceUUID);
-        if (!sensor.batteryService) {
-          if (COMMS) Serial.println("Battery service not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID);
-        if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
-          if (COMMS) Serial.println("Battery characteristic not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
-        if (!sensor.ioService) {
-          if (COMMS) Serial.println("IO service not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
-        if (!sensor.analogChar || !sensor.analogChar->canRead()) {
-          if (COMMS) Serial.println("Analog characteristic not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
-        if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
-          if (COMMS) Serial.println("Digital characteristic not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        // notifyCallbacks[] maps sensor index to its callback function
-        if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
-          if (COMMS) Serial.println("Notification subscription failed, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        if (COMMS) {
-          Serial.print("Sensor ");
-          Serial.print(targetSlot);
-          Serial.print(" connected and subscribed: ");
-          Serial.println(device->getAddress().toString().c_str());
-        }
-
-        connectedSensorCount++;
-        
-        if(connectedSensorCount == targetSensorCount)
-          break;
       }
     }
-  }
 
   if (connectedSensorCount == targetSensorCount) {
     // Only sort on initial connection. On reconnect, sensors are placed directly
