@@ -1,9 +1,5 @@
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
 #include "NimBLEDevice.h"
 #include <Preferences.h>
-#include "Secrets.h"  // WiFi/OTA credentials — NOT committed to git. See Secrets.h.example.
 #include <freertos/queue.h>
 
 QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
@@ -17,10 +13,6 @@ QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra ste
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
 #define ENABLE_PHONE_PERIPHERAL 1
 
-/************ WiFi OTA Stuff **************************************************/
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
-bool OTAUpdateEnable = 0;
 
 /************ BLE Sensor Stuff ************************************************/
 const char* targetLocalName = "ANR Corp M40";  // Match any device with the name for Muscle Sense Model M40
@@ -310,13 +302,6 @@ void scanAndConnectSensors(bool isReconnect) {
       Serial.print('$');  // Signal successful connection to ski
       break;
     }
-
-    //check for incoming byte from ski to trigger WiFi OTA
-    if (Serial.available()) {
-      if (Serial.read() == 'w') {
-        enterWifiOTA();  //signal from ski to enter wifi OTA
-      }
-    }
   }
 
   //check if connected sensors match save; skip calibration if they do
@@ -484,7 +469,6 @@ void readAndPrintSensors() {
 // --------------------------------------------------
 // Shared command handler (serial + BLE phone)
 // read/respond to serial input
-// 'w' - enter wifi pairing
 // '5' - calibrate sensors
 // 'c'/'f' - confirmation bytes for control change and calibration
 // 'l'/'r'/'u'/'d' + two ASCII digits (00-99) - continuous sensitivity for
@@ -529,16 +513,16 @@ void handleCommand(char cmd) {
 
   switch (cmd) {
 
-    case 'w':
-      for (int i = 0; i < targetSensorCount; i++) {
-        if (sensors[i].client && sensors[i].client->isConnected()) {
-          sensors[i].client->disconnect();
-        }
-      }
-      NimBLEDevice::deinit(true);
-      delay(1000);
-      enterWifiOTA();
-      break;
+    // case 'w':
+    //   for (int i = 0; i < targetSensorCount; i++) {
+    //     if (sensors[i].client && sensors[i].client->isConnected()) {
+    //       sensors[i].client->disconnect();
+    //     }
+    //   }
+    //   NimBLEDevice::deinit(true);
+    //   delay(1000);
+    //   enterWifiOTA();
+    //   break;
 
     case 'l':
       sensCmdSensorIndex = 0;
@@ -934,50 +918,4 @@ void calibrateThreshold() {
     setSensitivityBySensor(i, computeSensitivityOffset(50));
     sensitivityValues[i] = 50;
   }
-}
-
-
-// --------------------------------------------------
-// Enter Wifi OTA
-// --------------------------------------------------
-void enterWifiOTA() {
-
-  NimBLEDevice::deinit(true);
-  delay(1000);
-
-  if (COMMS) Serial.println("Entering WiFi OTA");
-
-  WiFi.begin(ssid, password);
-  delay(1000);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    if (COMMS) Serial.println("Connecting to WiFi...");
-  }
-  if (COMMS) Serial.println("Connected to WiFi");
-
-  ArduinoOTA.onStart([]() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {  //U_SPIFFS
-      type = "filesystem";
-    }
-    if (COMMS) Serial.println("Start updating " + type);
-    Serial.print('#');  //Send signal to ski that wifi update is starting
-  });
-  // ... (other OTA callbacks)
-
-  ArduinoOTA.begin();
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-  if (COMMS) Serial.println("Ready");
-  if (COMMS) Serial.print("IP address: ");
-  if (COMMS) Serial.println(WiFi.localIP());
-
-  Serial.print('@');  //Send signal to TetraSki that Wifi is connected
-
-  delay(1000);
-
-  while (1)
-    ArduinoOTA.handle();
 }
