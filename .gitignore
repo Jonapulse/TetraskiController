@@ -5,3 +5,7 @@ build/
 *.elf
 *.bin
 .pio/
+
+# PlatformIO auto-generated (local paths baked in)
+.vscode/c_cpp_properties.json
+.vscode/launch.json
