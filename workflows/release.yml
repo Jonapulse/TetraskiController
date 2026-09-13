@@ -1,0 +1,62 @@
+# To cut a release:
+#   1. Bump FIRMWARE_VERSION in the firmware source to match (or Safety check will fail)
+#   2. Commit that change normally.
+#   3. git tag v1.0.1
+#      git push origin v1.0.1
+
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  PIO_ENV: esp32dev
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code at the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python (required by PlatformIO)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # Safety check: fail loudly if the git tag and the firmware's own
+      # FIRMWARE_VERSION #define disagree, instead of silently publishing
+      # a release that advertises the wrong version to every app checking
+      # for updates. Searches the whole repo so this doesn't depend on
+      # knowing the exact file's path.
+      - name: Verify tag matches FIRMWARE_VERSION in source
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          SOURCE_FILE=$(grep -rl "define FIRMWARE_VERSION" --include="*.ino" --include="*.cpp" --include="*.h" .)
+          if [ -z "$SOURCE_FILE" ]; then
+            echo "Could not find any file defining FIRMWARE_VERSION"
+            exit 1
+          fi
+          SOURCE_VERSION=$(grep -oP '#define\s+FIRMWARE_VERSION\s+"\K[^"]+' "$SOURCE_FILE" | head -n1)
+          echo "Tag version:    $TAG_VERSION"
+          echo "Source version: $SOURCE_VERSION (from $SOURCE_FILE)"
+          if [ "$TAG_VERSION" != "$SOURCE_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match FIRMWARE_VERSION \"$SOURCE_VERSION\" in $SOURCE_FILE — bump the source and re-tag."
+            exit 1
+          fi
+
+      - name: Build firmware
+        run: pio run -e ${{ env.PIO_ENV }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: .pio/build/${{ env.PIO_ENV }}/firmware.bin
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
