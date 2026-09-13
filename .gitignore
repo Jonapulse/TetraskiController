@@ -1,2 +1,7 @@
 .DS_Store
 Secrets.h
+build/
+*.hex
+*.elf
+*.bin
+.pio/
