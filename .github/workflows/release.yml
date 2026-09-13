@@ -1,3 +1,4 @@
+
 # To cut a release:
 #   1. Bump FIRMWARE_VERSION in the firmware source to match (or Safety check will fail)
 #   2. Commit that change normally.
@@ -24,7 +25,7 @@ jobs:
       - name: Set up Python (required by PlatformIO)
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.11'
 
       - name: Install PlatformIO
         run: pip install --upgrade platformio
