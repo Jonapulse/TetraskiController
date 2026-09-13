@@ -12,6 +12,9 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: write
+
 env:
   PIO_ENV: esp32dev
 
