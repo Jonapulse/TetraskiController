@@ -3,18 +3,6 @@
 //
 // Provides a dedicated GATT service for receiving firmware images over BLE,
 // verifying them, and applying them via the ESP32 Update library.
-//
-// INTEGRATION POINTS (do these in your existing files):
-//   1. Call setupOTAService(pServer) from wherever PhonePeripheral.ino sets
-//      up the phone GATT server, after your existing config service is created.
-//   2. Call processOTAQueue() once per loop() iteration in MultiSensorAppTest.ino,
-//      alongside the existing commandQueue drain.
-//   3. Replace the placeholder UUIDs below with freshly generated ones.
-//
-// Written against NimBLE-Arduino 1.4+: onWrite(NimBLECharacteristic*, NimBLEConnInfo&),
-// getValue() returning std::string. If a future library bump changes either
-// signature, the fix is mechanical (drop/add the connInfo param, swap
-// std::string for NimBLEAttValue where needed).
 
 #include <NimBLEDevice.h>
 #include <Update.h>
@@ -25,9 +13,10 @@
 #define OTA_CONTROL_CHAR_UUID  "ed3c98b9-0a71-45e0-9b14-b89d3316549d"
 #define OTA_DATA_CHAR_UUID     "ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9"
 #define OTA_STATUS_CHAR_UUID   "5c8b02e7-5520-468f-bcba-fcc5093da1c9"
+#define OTA_VERSION_CHAR_UUID  "c82f2a3c-f48c-4cfa-b447-0277467898e4"
 
-// ---- Tunables ----
-#define OTA_CHUNK_PAYLOAD_MAX  180     // conservative, safe under MTU 185
+// ---- Tunables (most speedup rn on App.js end)
+#define OTA_CHUNK_PAYLOAD_MAX  512
 #define OTA_QUEUE_LEN          10      // backpressure depth before we flag an error
 #define OTA_IDLE_TIMEOUT_MS    15000   // ms with no activity before auto-abort
 
@@ -130,7 +119,9 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
           Serial.print("OTA: START received, size=");
           Serial.print(otaExpectedSize);
           Serial.print(" crc=0x");
-          Serial.println(otaExpectedCRC, HEX);
+          Serial.print(otaExpectedCRC, HEX);
+          Serial.print(" connMTU=");
+          Serial.println(connInfo.getMTU());
         }
 
         if (!Update.begin(otaExpectedSize)) {
@@ -201,7 +192,13 @@ class OTADataCallbacks : public NimBLECharacteristicCallbacks {
     if (chunk.len > OTA_CHUNK_PAYLOAD_MAX) {
       // Shouldn't happen given fixed conservative chunk sizing on the app
       // side, but never buffer-overflow if something unexpected arrives.
-      if (COMMS) Serial.println("OTA: oversized chunk received, aborting");
+      if (COMMS) {
+        Serial.print("OTA: oversized chunk received (");
+        Serial.print(chunk.len);
+        Serial.print(" bytes, raw value.size()=");
+        Serial.print(value.size());
+        Serial.println("), aborting");
+      }
       otaState = OTA_ST_ERROR;
       sendOTAStatus(OTA_STATUS_ERR_WRITE);
       return;
@@ -244,6 +241,16 @@ void setupOTAService(NimBLEServer* pServer) {
     OTA_STATUS_CHAR_UUID,
     NIMBLE_PROPERTY::NOTIFY
   );
+
+  // Static value, set once — read by the app before/after a transfer to
+  // compare against a release manifest and to confirm a reboot actually
+  // landed on the expected new version. FIRMWARE_VERSION is #defined in
+  // the main sketch (TetraEMGControl.ino).
+  NimBLECharacteristic* pVersionChar = pOTAService->createCharacteristic(
+    OTA_VERSION_CHAR_UUID,
+    NIMBLE_PROPERTY::READ
+  );
+  pVersionChar->setValue((uint8_t*)FIRMWARE_VERSION, strlen(FIRMWARE_VERSION));
 
   pOTAService->start();
 }

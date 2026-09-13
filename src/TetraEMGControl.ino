@@ -9,6 +9,8 @@ QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra ste
 #define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
+#define FIRMWARE_VERSION "1.0.0"
+
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
 #define ENABLE_PHONE_PERIPHERAL 1
@@ -272,16 +274,17 @@ bool loadAndMatchSettings() {
 void setup() {
 
   Serial.begin(57600);
+  if (COMMS) {
+    Serial.print("Firmware version: ");
+    Serial.println(FIRMWARE_VERSION);
+  }
 
   //power status LED
   pinMode(26, OUTPUT);
   digitalWrite(26, HIGH);
 
   NimBLEDevice::init("TetraRadio");
-
-  if (COMMS) {
-        Serial.print("OTA update successful 0.1");
-      }
+  NimBLEDevice::setMTU(517);
 
   // Depth 16 so a burst of writes (e.g. a 3-byte sensitivity command arriving
   // right after other traffic) can't overflow before loop() drains it.
