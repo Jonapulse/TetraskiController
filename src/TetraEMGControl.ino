@@ -5,7 +5,7 @@
 QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
-#define COMMS 1
+#define COMMS 0
 #define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
