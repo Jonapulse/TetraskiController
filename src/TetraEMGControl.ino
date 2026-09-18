@@ -9,7 +9,7 @@ QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra ste
 #define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
-#define FIRMWARE_VERSION "1.0.5"
+#define FIRMWARE_VERSION "1.0.6"
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
