@@ -5,11 +5,11 @@
 QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
-#define COMMS 0
+#define COMMS 1
 #define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
-#define FIRMWARE_VERSION "1.0.3"
+#define FIRMWARE_VERSION "1.0.7"
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
@@ -643,142 +643,140 @@ bool connectSensors(bool isReconnect) {
 
   long scanStart = millis();
 
-  if (COMMS)
+  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
 
-    while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
+    NimBLEScanResults results = pScan->getResults(1000, false);
 
-      NimBLEScanResults results = pScan->getResults(1000, false);
+    for (int i = 0; i < results.getCount(); i++) {
+      const NimBLEAdvertisedDevice* device = results.getDevice(i);
+      std::string name = device->getName();
 
-      for (int i = 0; i < results.getCount(); i++) {
-        const NimBLEAdvertisedDevice* device = results.getDevice(i);
-        std::string name = device->getName();
+      if (COMMS) {
+        Serial.print("Found: ");
+        Serial.print(device->getAddress().toString().c_str());
+        Serial.print(" | Name: ");
+        Serial.println(name.c_str());
+      }
 
+      if (name == targetLocalName) {
         if (COMMS) {
-          Serial.print("Found: ");
-          Serial.print(device->getAddress().toString().c_str());
-          Serial.print(" | Name: ");
-          Serial.println(name.c_str());
+          Serial.print("Target found: ");
+          Serial.println(device->getAddress().toString().c_str());
         }
 
-        if (name == targetLocalName) {
-          if (COMMS) {
-            Serial.print("Target found: ");
-            Serial.println(device->getAddress().toString().c_str());
+        String foundMAC = String(device->getAddress().toString().c_str());
+
+        // Skip sensors that are already connected — avoids duplicate clients on reconnect
+        bool alreadyConnected = false;
+        for (int s = 0; s < targetSensorCount; s++) {
+          if (sensors[s].client && sensors[s].client->isConnected() && String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
+            if (COMMS) Serial.println("Already connected, skipping");
+            alreadyConnected = true;
+            break;
           }
+        }
+        if (alreadyConnected) continue;
 
-          String foundMAC = String(device->getAddress().toString().c_str());
-
-          // Skip sensors that are already connected — avoids duplicate clients on reconnect
-          bool alreadyConnected = false;
-          for (int s = 0; s < targetSensorCount; s++) {
-            if (sensors[s].client && sensors[s].client->isConnected() && String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
-              if (COMMS) Serial.println("Already connected, skipping");
-              alreadyConnected = true;
+        // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
+        int targetSlot = connectedSensorCount;
+        for (int s = 0; s < targetSensorCount; s++) {
+          if (!sensors[s].client || !sensors[s].client->isConnected()) {
+            // Check if saved MAC for this slot matches
+            prefs.begin("tetra", true);
+            char key[8];
+            snprintf(key, sizeof(key), "mac%d", s);
+            String savedMAC = prefs.getString(key, "");
+            prefs.end();
+            if (savedMAC == foundMAC) {
+              targetSlot = s;
+              if (COMMS) {
+                Serial.print("Matched to saved slot ");
+                Serial.println(s);
+              }
               break;
             }
           }
-          if (alreadyConnected) continue;
-
-          // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
-          int targetSlot = connectedSensorCount;
-          for (int s = 0; s < targetSensorCount; s++) {
-            if (!sensors[s].client || !sensors[s].client->isConnected()) {
-              // Check if saved MAC for this slot matches
-              prefs.begin("tetra", true);
-              char key[8];
-              snprintf(key, sizeof(key), "mac%d", s);
-              String savedMAC = prefs.getString(key, "");
-              prefs.end();
-              if (savedMAC == foundMAC) {
-                targetSlot = s;
-                if (COMMS) {
-                  Serial.print("Matched to saved slot ");
-                  Serial.println(s);
-                }
-                break;
-              }
-            }
-          }
-
-          SensorBLE& sensor = sensors[targetSlot];
-
-          // Free any stale client object left over from a previous disconnect
-          if (sensor.client) {
-            NimBLEDevice::deleteClient(sensor.client);
-            sensor.client = nullptr;
-          }
-
-          sensor.client = NimBLEDevice::createClient();
-          if (!sensor.client) {
-            if (COMMS) Serial.println("Client creation failed, skipping");
-            continue;
-          }
-
-          sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
-
-          if (!sensor.client->connect(device)) {
-            if (COMMS) Serial.println("Connection failed, skipping");
-            NimBLEDevice::deleteClient(sensor.client);
-            sensor.client = nullptr;
-            continue;
-          }
-
-          sensor.batteryService = sensor.client->getService(battServiceUUID);
-          if (!sensor.batteryService) {
-            if (COMMS) Serial.println("Battery service not found, skipping");
-            sensor.client->disconnect();
-            continue;
-          }
-
-          sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID);
-          if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
-            if (COMMS) Serial.println("Battery characteristic not found, skipping");
-            sensor.client->disconnect();
-            continue;
-          }
-
-          sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
-          if (!sensor.ioService) {
-            if (COMMS) Serial.println("IO service not found, skipping");
-            sensor.client->disconnect();
-            continue;
-          }
-
-          sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
-          if (!sensor.analogChar || !sensor.analogChar->canRead()) {
-            if (COMMS) Serial.println("Analog characteristic not found, skipping");
-            sensor.client->disconnect();
-            continue;
-          }
-
-          sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
-          if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
-            if (COMMS) Serial.println("Digital characteristic not found, skipping");
-            sensor.client->disconnect();
-            continue;
-          }
-
-          // notifyCallbacks[] maps sensor index to its callback function
-          if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
-            if (COMMS) Serial.println("Notification subscription failed, skipping");
-            sensor.client->disconnect();
-            continue;
-          }
-
-          if (COMMS) {
-            Serial.print("Sensor ");
-            Serial.print(targetSlot);
-            Serial.print(" connected and subscribed: ");
-            Serial.println(device->getAddress().toString().c_str());
-          }
-
-          connectedSensorCount++;
-
-          if (connectedSensorCount == targetSensorCount)
-            break;
         }
+
+        SensorBLE& sensor = sensors[targetSlot];
+
+        // Free any stale client object left over from a previous disconnect
+        if (sensor.client) {
+          NimBLEDevice::deleteClient(sensor.client);
+          sensor.client = nullptr;
+        }
+
+        sensor.client = NimBLEDevice::createClient();
+        if (!sensor.client) {
+          if (COMMS) Serial.println("Client creation failed, skipping");
+          continue;
+        }
+
+        sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
+
+        if (!sensor.client->connect(device)) {
+          if (COMMS) Serial.println("Connection failed, skipping");
+          NimBLEDevice::deleteClient(sensor.client);
+          sensor.client = nullptr;
+          continue;
+        }
+
+        sensor.batteryService = sensor.client->getService(battServiceUUID);
+        if (!sensor.batteryService) {
+          if (COMMS) Serial.println("Battery service not found, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID);
+        if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
+          if (COMMS) Serial.println("Battery characteristic not found, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
+        if (!sensor.ioService) {
+          if (COMMS) Serial.println("IO service not found, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
+        if (!sensor.analogChar || !sensor.analogChar->canRead()) {
+          if (COMMS) Serial.println("Analog characteristic not found, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
+        if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
+          if (COMMS) Serial.println("Digital characteristic not found, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        // notifyCallbacks[] maps sensor index to its callback function
+        if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
+          if (COMMS) Serial.println("Notification subscription failed, skipping");
+          sensor.client->disconnect();
+          continue;
+        }
+
+        if (COMMS) {
+          Serial.print("Sensor ");
+          Serial.print(targetSlot);
+          Serial.print(" connected and subscribed: ");
+          Serial.println(device->getAddress().toString().c_str());
+        }
+
+        connectedSensorCount++;
+
+        if (connectedSensorCount == targetSensorCount)
+          break;
       }
     }
+  }
 
   if (connectedSensorCount == targetSensorCount) {
     // Only sort on initial connection. On reconnect, sensors are placed directly

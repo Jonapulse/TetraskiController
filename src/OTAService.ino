@@ -251,8 +251,6 @@ void setupOTAService(NimBLEServer* pServer) {
     NIMBLE_PROPERTY::READ
   );
   pVersionChar->setValue((uint8_t*)FIRMWARE_VERSION, strlen(FIRMWARE_VERSION));
-
-  pOTAService->start();
 }
 
 // --------------------------------------------------
