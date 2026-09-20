@@ -5,11 +5,11 @@
 QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
-#define COMMS 1
+#define COMMS 0
 #define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
-#define FIRMWARE_VERSION "1.0.7"
+#define FIRMWARE_VERSION "1.0.8"
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
