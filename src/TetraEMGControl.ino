@@ -42,8 +42,10 @@ volatile uint16_t latestAnalogValues[MAX_SENSOR_COUNT] = { 0 };
 volatile bool newValueReady[MAX_SENSOR_COUNT] = { false };
 
 volatile bool sensorDisconnectFlagged = false;
+bool sensorsReady = false;      //true once all targetSensorCount sensors are connected and calibrated; loop() only runs sensor logic when true
+bool sensorsReconnect = false;  //passed to scanAndConnectSensors() as isReconnect while sensorsReady is false
 
-#define RECONNECT_FREQ 10000  //10 seconds
+#define CALIBRATION_TIMEOUT 40000  //40 seconds. Samples arrive at ~10 Hz, so 200 samples take ~20 s
 
 //Sensitivities
 //Continuous sensitivity setting: incoming raw value is 0-99, mapped onto
@@ -153,6 +155,9 @@ extern NimBLECharacteristic* pSensorDataChar;
 extern NimBLECharacteristic* pBatteryDataChar;
 extern NimBLEServer* pPhoneServer;
 extern uint16_t phoneConnHandle;
+bool otaBusy();  //defined in OTAService.ino
+#else
+inline bool otaBusy() { return false; }
 #endif
 
 
@@ -297,27 +302,24 @@ void setup() {
   prefs.begin("tetra", true);
   targetSensorCount = prefs.getInt("sensorCount", DEFAULT_SENSOR_COUNT);
   prefs.end();
-
-  scanAndConnectSensors();
 }
 
+// Makes one bounded scan/connect pass and returns. loop() calls this every iteration
+// while sensorsReady is false, so Serial, the command queue, and OTA keep being serviced.
 void scanAndConnectSensors(bool isReconnect) {
-  while (1) {  //Enter connection loop
+  //one scan pass; not all sensors found yet, loop() will call again
+  if (!connectSensors(isReconnect)) return;
 
-    //attempt to connect again until connection established
-    if (connectSensors(isReconnect)) {
-      Serial.print('$');  // Signal successful connection to ski
-      break;
-    }
-  }
+  Serial.print('$');  // Signal successful connection to ski
 
   //check if connected sensors match save; skip calibration if they do
   if (!loadAndMatchSettings()) {
-    calibrateThreshold();
+    if (!calibrateThreshold()) return;  // aborted (sensor dropped or timed out), retry on next pass
     saveSettings();  // save fresh calibration
   }
 
   sensorDisconnectFlagged = false;  // clear after successful reconnect, not before — avoids missing a drop that occurs during the reconnect attempt
+  sensorsReady = true;
 }
 
 // --------------------------------------------------
@@ -339,12 +341,18 @@ void loop() {
   processOTAQueue();  // drains queued firmware chunks, drives OTA state machine — see OTAService.ino
 #endif
 
+  if (!sensorsReady) {
+    if (!otaBusy()) scanAndConnectSensors(sensorsReconnect);  //no scanning during OTA, loop() must stay fast
+    return;
+  }
+
   readAndPrintSensors();
 
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
   if (sensorDisconnectFlagged) {
     if (COMMS) Serial.println("Sensor drop detected — reconnecting...");
-    scanAndConnectSensors(true);  // isReconnect=true: skips sort, uses saved MAC slots
+    sensorsReady = false;
+    sensorsReconnect = true;  // isReconnect=true: skips sort, uses saved MAC slots
   }
 }
 
@@ -502,6 +510,14 @@ uint8_t sensCmdDigit1 = 0;
 
 void handleCommand(char cmd) {
 
+  // Everything except phone disconnect and clear-save needs connected, calibrated sensors,
+  // and is ignored during OTA so a blocking command (calibration) can't overrun the OTA queue.
+  if ((!sensorsReady || otaBusy()) && cmd != 'x' && cmd != 'z') {
+    sensCmdState = SENS_CMD_IDLE;
+    if (COMMS) Serial.println("Sensors not ready or OTA in progress, ignoring command");
+    return;
+  }
+
   // Continue parsing a pending sensitivity command if one is in progress.
   // A non-digit byte where a digit is expected aborts the partial command;
   // that byte then falls through to be processed as a normal command below.
@@ -571,8 +587,7 @@ void handleCommand(char cmd) {
 
     case '5':
       Serial.print('c');
-      calibrateThreshold();
-      saveSettings();
+      if (calibrateThreshold()) saveSettings();
       Serial.print('f');
       break;
 
@@ -605,8 +620,10 @@ void handleCommand(char cmd) {
     case 'p':
       targetSensorCount = 4;
       saveSettings();
-      if (connectedSensorCount < targetSensorCount)
-        scanAndConnectSensors(true);  //reconnect = true boolean flagged so we don't resort the left/right sensor values
+      if (connectedSensorCount < targetSensorCount) {
+        sensorsReady = false;      //loop() runs the scan
+        sensorsReconnect = true;  //reconnect = true boolean flagged so we don't resort the left/right sensor values
+      }
       break;
 
     case 'x':
@@ -641,142 +658,140 @@ bool connectSensors(bool isReconnect) {
   NimBLEScan* pScan = NimBLEDevice::getScan();
   pScan->setActiveScan(true);
 
-  long scanStart = millis();
+    if (connectedSensorCount < targetSensorCount) {
 
-  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
+      NimBLEScanResults results = pScan->getResults(1000, false);
 
-    NimBLEScanResults results = pScan->getResults(1000, false);
+      for (int i = 0; i < results.getCount(); i++) {
+        const NimBLEAdvertisedDevice* device = results.getDevice(i);
+        std::string name = device->getName();
 
-    for (int i = 0; i < results.getCount(); i++) {
-      const NimBLEAdvertisedDevice* device = results.getDevice(i);
-      std::string name = device->getName();
-
-      if (COMMS) {
-        Serial.print("Found: ");
-        Serial.print(device->getAddress().toString().c_str());
-        Serial.print(" | Name: ");
-        Serial.println(name.c_str());
-      }
-
-      if (name == targetLocalName) {
         if (COMMS) {
-          Serial.print("Target found: ");
-          Serial.println(device->getAddress().toString().c_str());
+          Serial.print("Found: ");
+          Serial.print(device->getAddress().toString().c_str());
+          Serial.print(" | Name: ");
+          Serial.println(name.c_str());
         }
 
-        String foundMAC = String(device->getAddress().toString().c_str());
-
-        // Skip sensors that are already connected — avoids duplicate clients on reconnect
-        bool alreadyConnected = false;
-        for (int s = 0; s < targetSensorCount; s++) {
-          if (sensors[s].client && sensors[s].client->isConnected() && String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
-            if (COMMS) Serial.println("Already connected, skipping");
-            alreadyConnected = true;
-            break;
+        if (name == targetLocalName) {
+          if (COMMS) {
+            Serial.print("Target found: ");
+            Serial.println(device->getAddress().toString().c_str());
           }
-        }
-        if (alreadyConnected) continue;
 
-        // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
-        int targetSlot = connectedSensorCount;
-        for (int s = 0; s < targetSensorCount; s++) {
-          if (!sensors[s].client || !sensors[s].client->isConnected()) {
-            // Check if saved MAC for this slot matches
-            prefs.begin("tetra", true);
-            char key[8];
-            snprintf(key, sizeof(key), "mac%d", s);
-            String savedMAC = prefs.getString(key, "");
-            prefs.end();
-            if (savedMAC == foundMAC) {
-              targetSlot = s;
-              if (COMMS) {
-                Serial.print("Matched to saved slot ");
-                Serial.println(s);
-              }
+          String foundMAC = String(device->getAddress().toString().c_str());
+
+          // Skip sensors that are already connected — avoids duplicate clients on reconnect
+          bool alreadyConnected = false;
+          for (int s = 0; s < targetSensorCount; s++) {
+            if (sensors[s].client && sensors[s].client->isConnected() && String(sensors[s].client->getPeerAddress().toString().c_str()) == foundMAC) {
+              if (COMMS) Serial.println("Already connected, skipping");
+              alreadyConnected = true;
               break;
             }
           }
+          if (alreadyConnected) continue;
+
+          // Place sensor into its saved MAC slot if one matches, otherwise use next open slot.
+          int targetSlot = connectedSensorCount;
+          for (int s = 0; s < targetSensorCount; s++) {
+            if (!sensors[s].client || !sensors[s].client->isConnected()) {
+              // Check if saved MAC for this slot matches
+              prefs.begin("tetra", true);
+              char key[8];
+              snprintf(key, sizeof(key), "mac%d", s);
+              String savedMAC = prefs.getString(key, "");
+              prefs.end();
+              if (savedMAC == foundMAC) {
+                targetSlot = s;
+                if (COMMS) {
+                  Serial.print("Matched to saved slot ");
+                  Serial.println(s);
+                }
+                break;
+              }
+            }
+          }
+
+          SensorBLE& sensor = sensors[targetSlot];
+
+          // Free any stale client object left over from a previous disconnect
+          if (sensor.client) {
+            NimBLEDevice::deleteClient(sensor.client);
+            sensor.client = nullptr;
+          }
+
+          sensor.client = NimBLEDevice::createClient();
+          if (!sensor.client) {
+            if (COMMS) Serial.println("Client creation failed, skipping");
+            continue;
+          }
+
+          sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
+
+          if (!sensor.client->connect(device)) {
+            if (COMMS) Serial.println("Connection failed, skipping");
+            NimBLEDevice::deleteClient(sensor.client);
+            sensor.client = nullptr;
+            continue;
+          }
+
+          sensor.batteryService = sensor.client->getService(battServiceUUID);
+          if (!sensor.batteryService) {
+            if (COMMS) Serial.println("Battery service not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID);
+          if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
+            if (COMMS) Serial.println("Battery characteristic not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
+          if (!sensor.ioService) {
+            if (COMMS) Serial.println("IO service not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
+          if (!sensor.analogChar || !sensor.analogChar->canRead()) {
+            if (COMMS) Serial.println("Analog characteristic not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
+          if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
+            if (COMMS) Serial.println("Digital characteristic not found, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          // notifyCallbacks[] maps sensor index to its callback function
+          if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
+            if (COMMS) Serial.println("Notification subscription failed, skipping");
+            sensor.client->disconnect();
+            continue;
+          }
+
+          if (COMMS) {
+            Serial.print("Sensor ");
+            Serial.print(targetSlot);
+            Serial.print(" connected and subscribed: ");
+            Serial.println(device->getAddress().toString().c_str());
+          }
+
+          connectedSensorCount++;
+
+          if (connectedSensorCount == targetSensorCount)
+            break;
         }
-
-        SensorBLE& sensor = sensors[targetSlot];
-
-        // Free any stale client object left over from a previous disconnect
-        if (sensor.client) {
-          NimBLEDevice::deleteClient(sensor.client);
-          sensor.client = nullptr;
-        }
-
-        sensor.client = NimBLEDevice::createClient();
-        if (!sensor.client) {
-          if (COMMS) Serial.println("Client creation failed, skipping");
-          continue;
-        }
-
-        sensor.client->setClientCallbacks(&sensorClientCallbacks, false);
-
-        if (!sensor.client->connect(device)) {
-          if (COMMS) Serial.println("Connection failed, skipping");
-          NimBLEDevice::deleteClient(sensor.client);
-          sensor.client = nullptr;
-          continue;
-        }
-
-        sensor.batteryService = sensor.client->getService(battServiceUUID);
-        if (!sensor.batteryService) {
-          if (COMMS) Serial.println("Battery service not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.batteryChar = sensor.batteryService->getCharacteristic(battCharUUID);
-        if (!sensor.batteryChar || !sensor.batteryChar->canRead()) {
-          if (COMMS) Serial.println("Battery characteristic not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.ioService = sensor.client->getService(AutoIOServiceUUID);
-        if (!sensor.ioService) {
-          if (COMMS) Serial.println("IO service not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.analogChar = sensor.ioService->getCharacteristic(AnalogCharUUID);
-        if (!sensor.analogChar || !sensor.analogChar->canRead()) {
-          if (COMMS) Serial.println("Analog characteristic not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        sensor.digitalChar = sensor.ioService->getCharacteristic(DigitalCharUUID);
-        if (!sensor.digitalChar || !sensor.digitalChar->canWrite()) {
-          if (COMMS) Serial.println("Digital characteristic not found, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        // notifyCallbacks[] maps sensor index to its callback function
-        if (!sensor.analogChar->subscribe(true, notifyCallbacks[targetSlot])) {
-          if (COMMS) Serial.println("Notification subscription failed, skipping");
-          sensor.client->disconnect();
-          continue;
-        }
-
-        if (COMMS) {
-          Serial.print("Sensor ");
-          Serial.print(targetSlot);
-          Serial.print(" connected and subscribed: ");
-          Serial.println(device->getAddress().toString().c_str());
-        }
-
-        connectedSensorCount++;
-
-        if (connectedSensorCount == targetSensorCount)
-          break;
       }
     }
-  }
 
   if (connectedSensorCount == targetSensorCount) {
     // Only sort on initial connection. On reconnect, sensors are placed directly
@@ -790,7 +805,7 @@ bool connectSensors(bool isReconnect) {
   }
 
   if (COMMS) {
-    Serial.print("Timeout. Connected ");
+    Serial.print("Not all sensors found yet. Connected ");
     Serial.print(connectedSensorCount);
     Serial.print(" of ");
     Serial.println(targetSensorCount);
@@ -894,37 +909,50 @@ void applySensitivity(uint8_t sensorIndex, uint8_t rawValue) {
 // --------------------------------------------------
 // Calibrate sensors to baseline
 // --------------------------------------------------
-void calibrateThreshold() {
+// Returns false if a sensor drops or CALIBRATION_TIMEOUT passes before all samples arrive.
+// Existing averages/thresholds are left untouched in that case.
+bool calibrateThreshold() {
 
   uint8_t orangeLED = 12;
 
   for (int i = 0; i < targetSensorCount; i++) {
     sensors[i].digitalChar->writeValue(&orangeLED, 1);
-    sensorAverages[i] = 0;
   }
 
   if (COMMS) Serial.println("Starting Calibration");
 
+  uint16_t newAverages[MAX_SENSOR_COUNT] = { 0 };
   int samplesCollected[MAX_SENSOR_COUNT] = { 0 };
+  unsigned long calibrationStart = millis();
   while (true) {
     bool allDone = true;
     for (int i = 0; i < targetSensorCount; i++) {
       if (samplesCollected[i] < SIZE_OF_AVE) {
         allDone = false;
+        if (!sensors[i].client || !sensors[i].client->isConnected()) {
+          if (COMMS) Serial.println("Calibration aborted: sensor disconnected");
+          return false;
+        }
         if (newValueReady[i]) {
-          sensorAverages[i] += latestAnalogValues[i];
+          newAverages[i] += latestAnalogValues[i];
           newValueReady[i] = false;
           samplesCollected[i]++;
         }
       }
     }
     if (allDone) break;
+    if (millis() - calibrationStart > CALIBRATION_TIMEOUT) {
+      if (COMMS) Serial.println("Calibration aborted: timeout");
+      return false;
+    }
     delay(5);  //yield to allow BLE stack to deliver notifications
   }
 
   for (int i = 0; i < targetSensorCount; i++) {
+    sensorAverages[i] = newAverages[i];
     //default to mid-point sensitivity on fresh calibration
     setSensitivityBySensor(i, computeSensitivityOffset(50));
     sensitivityValues[i] = 50;
   }
+  return true;
 }

@@ -30,6 +30,7 @@ enum OTAState {
 };
 
 static volatile OTAState otaState = OTA_ST_IDLE;
+static volatile bool otaStartPending = false;  // START received on the BLE host task, Update.begin() not run yet
 
 struct OTAChunk {
   uint16_t seq;
@@ -78,6 +79,7 @@ static void sendOTAProgress() {
 
 static void otaReset() {
   otaState = OTA_ST_IDLE;
+  otaStartPending = false;
   otaExpectedSize = 0;
   otaExpectedCRC = 0;
   otaBytesWritten = 0;
@@ -103,7 +105,7 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
     switch (cmd) {
 
       case 'S': { // START: 'S' + size(4 LE) + crc32(4 LE)  -> 9 bytes total
-        if (otaState != OTA_ST_IDLE) {
+        if (otaState != OTA_ST_IDLE || otaStartPending) {
           sendOTAStatus(OTA_STATUS_ERR_STATE);
           return;
         }
@@ -124,23 +126,11 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
           Serial.println(connInfo.getMTU());
         }
 
-        if (!Update.begin(otaExpectedSize)) {
-          if (COMMS) {
-            Serial.print("OTA: Update.begin() failed: ");
-            Serial.println(Update.errorString());
-          }
-          sendOTAStatus(OTA_STATUS_ERR_BEGIN); // covers oversize-for-partition too
-          otaReset();
-          return;
-        }
-
-        otaBytesWritten = 0;
-        otaRunningCRC = 0;
-        otaExpectedSeq = 0;
-        otaLastActivityMs = millis();
-        otaState = OTA_ST_RECEIVING;
-
-        sendOTAStatus(OTA_STATUS_READY);
+        // Update.begin(), the RECEIVING transition, and READY are handled by
+        // processOTAQueue() on the main task. loop() may be mid scan pass or
+        // calibration, and READY tells the app to start sending chunks, so it
+        // must not go out until loop() is free to drain the queue.
+        otaStartPending = true;
         break;
       }
 
@@ -254,11 +244,45 @@ void setupOTAService(NimBLEServer* pServer) {
 }
 
 // --------------------------------------------------
+// Public: true from START until the transfer finishes, fails, or is aborted.
+// The main sketch uses this to stay out of the way (no sensor scanning, no
+// blocking commands) so processOTAQueue() runs every loop() iteration.
+// --------------------------------------------------
+bool otaBusy() {
+  return otaStartPending ||
+         otaState == OTA_ST_RECEIVING ||
+         otaState == OTA_ST_VERIFYING ||
+         otaState == OTA_ST_APPLYING;
+}
+
+// --------------------------------------------------
 // Public: call once per loop() to drain queued chunks and drive the
 // state machine forward. Mirrors the existing commandQueue drain pattern.
 // --------------------------------------------------
 void processOTAQueue() {
   OTAChunk chunk;
+
+  if (otaStartPending) {
+    otaStartPending = false;
+
+    if (!Update.begin(otaExpectedSize)) {
+      if (COMMS) {
+        Serial.print("OTA: Update.begin() failed: ");
+        Serial.println(Update.errorString());
+      }
+      sendOTAStatus(OTA_STATUS_ERR_BEGIN); // covers oversize-for-partition too
+      otaReset();
+      return;
+    }
+
+    otaBytesWritten = 0;
+    otaRunningCRC = 0;
+    otaExpectedSeq = 0;
+    otaLastActivityMs = millis();
+    otaState = OTA_ST_RECEIVING;
+
+    sendOTAStatus(OTA_STATUS_READY);
+  }
 
   while (xQueueReceive(otaQueue, &chunk, 0) == pdTRUE) {
 
