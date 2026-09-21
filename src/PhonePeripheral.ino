@@ -137,8 +137,6 @@ void setupPhonePeripheral() {
   );
   pConfigChar->setCallbacks(new ConfigCallbacks());
 
-  pService->start();
-
   // OTA service lives on the same server as the phone's main service — it's
   // part of the phone-facing peripheral role, just like everything else in
   // this file. Defined in OTAService.ino.

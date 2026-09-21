@@ -5,11 +5,11 @@
 QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra step so some commands (recalibrate was one) from phone don't deadlock the chip.
 
 //Serial output for development/debugging. TURN OFF FOR TETRASKI USE
-#define COMMS 0
+#define COMMS 1
 #define DEFAULT_SENSOR_COUNT 2
 #define MAX_SENSOR_COUNT 4
 
-#define FIRMWARE_VERSION "1.0.6"
+#define FIRMWARE_VERSION "1.0.8"
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
@@ -42,8 +42,10 @@ volatile uint16_t latestAnalogValues[MAX_SENSOR_COUNT] = { 0 };
 volatile bool newValueReady[MAX_SENSOR_COUNT] = { false };
 
 volatile bool sensorDisconnectFlagged = false;
+bool sensorsReady = false;      //true once all targetSensorCount sensors are connected and calibrated; loop() only runs sensor logic when true
+bool sensorsReconnect = false;  //passed to scanAndConnectSensors() as isReconnect while sensorsReady is false
 
-#define RECONNECT_FREQ 10000  //10 seconds
+#define CALIBRATION_TIMEOUT 40000  //40 seconds. Samples arrive at ~10 Hz, so 200 samples take ~20 s
 
 //Sensitivities
 //Continuous sensitivity setting: incoming raw value is 0-99, mapped onto
@@ -153,6 +155,9 @@ extern NimBLECharacteristic* pSensorDataChar;
 extern NimBLECharacteristic* pBatteryDataChar;
 extern NimBLEServer* pPhoneServer;
 extern uint16_t phoneConnHandle;
+bool otaBusy();  //defined in OTAService.ino
+#else
+inline bool otaBusy() { return false; }
 #endif
 
 
@@ -297,27 +302,24 @@ void setup() {
   prefs.begin("tetra", true);
   targetSensorCount = prefs.getInt("sensorCount", DEFAULT_SENSOR_COUNT);
   prefs.end();
-
-  scanAndConnectSensors();
 }
 
+// Makes one bounded scan/connect pass and returns. loop() calls this every iteration
+// while sensorsReady is false, so Serial, the command queue, and OTA keep being serviced.
 void scanAndConnectSensors(bool isReconnect) {
-  while (1) {  //Enter connection loop
+  //one scan pass; not all sensors found yet, loop() will call again
+  if (!connectSensors(isReconnect)) return;
 
-    //attempt to connect again until connection established
-    if (connectSensors(isReconnect)) {
-      Serial.print('$');  // Signal successful connection to ski
-      break;
-    }
-  }
+  Serial.print('$');  // Signal successful connection to ski
 
   //check if connected sensors match save; skip calibration if they do
   if (!loadAndMatchSettings()) {
-    calibrateThreshold();
+    if (!calibrateThreshold()) return;  // aborted (sensor dropped or timed out), retry on next pass
     saveSettings();  // save fresh calibration
   }
 
   sensorDisconnectFlagged = false;  // clear after successful reconnect, not before — avoids missing a drop that occurs during the reconnect attempt
+  sensorsReady = true;
 }
 
 // --------------------------------------------------
@@ -339,12 +341,18 @@ void loop() {
   processOTAQueue();  // drains queued firmware chunks, drives OTA state machine — see OTAService.ino
 #endif
 
+  if (!sensorsReady) {
+    if (!otaBusy()) scanAndConnectSensors(sensorsReconnect);  //no scanning during OTA, loop() must stay fast
+    return;
+  }
+
   readAndPrintSensors();
 
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
   if (sensorDisconnectFlagged) {
     if (COMMS) Serial.println("Sensor drop detected — reconnecting...");
-    scanAndConnectSensors(true);  // isReconnect=true: skips sort, uses saved MAC slots
+    sensorsReady = false;
+    sensorsReconnect = true;  // isReconnect=true: skips sort, uses saved MAC slots
   }
 }
 
@@ -502,6 +510,14 @@ uint8_t sensCmdDigit1 = 0;
 
 void handleCommand(char cmd) {
 
+  // Everything except phone disconnect and clear-save needs connected, calibrated sensors,
+  // and is ignored during OTA so a blocking command (calibration) can't overrun the OTA queue.
+  if ((!sensorsReady || otaBusy()) && cmd != 'x' && cmd != 'z') {
+    sensCmdState = SENS_CMD_IDLE;
+    if (COMMS) Serial.println("Sensors not ready or OTA in progress, ignoring command");
+    return;
+  }
+
   // Continue parsing a pending sensitivity command if one is in progress.
   // A non-digit byte where a digit is expected aborts the partial command;
   // that byte then falls through to be processed as a normal command below.
@@ -571,8 +587,7 @@ void handleCommand(char cmd) {
 
     case '5':
       Serial.print('c');
-      calibrateThreshold();
-      saveSettings();
+      if (calibrateThreshold()) saveSettings();
       Serial.print('f');
       break;
 
@@ -605,8 +620,10 @@ void handleCommand(char cmd) {
     case 'p':
       targetSensorCount = 4;
       saveSettings();
-      if (connectedSensorCount < targetSensorCount)
-        scanAndConnectSensors(true);  //reconnect = true boolean flagged so we don't resort the left/right sensor values
+      if (connectedSensorCount < targetSensorCount) {
+        sensorsReady = false;      //loop() runs the scan
+        sensorsReconnect = true;  //reconnect = true boolean flagged so we don't resort the left/right sensor values
+      }
       break;
 
     case 'x':
@@ -641,9 +658,7 @@ bool connectSensors(bool isReconnect) {
   NimBLEScan* pScan = NimBLEDevice::getScan();
   pScan->setActiveScan(true);
 
-  long scanStart = millis();
-
-  while (millis() - scanStart < RECONNECT_FREQ && connectedSensorCount < targetSensorCount) {
+    if (connectedSensorCount < targetSensorCount) {
 
     NimBLEScanResults results = pScan->getResults(1000, false);
 
@@ -789,7 +804,7 @@ bool connectSensors(bool isReconnect) {
   }
 
   if (COMMS) {
-    Serial.print("Timeout. Connected ");
+    Serial.print("Not all sensors found yet. Connected ");
     Serial.print(connectedSensorCount);
     Serial.print(" of ");
     Serial.println(targetSensorCount);
@@ -893,37 +908,50 @@ void applySensitivity(uint8_t sensorIndex, uint8_t rawValue) {
 // --------------------------------------------------
 // Calibrate sensors to baseline
 // --------------------------------------------------
-void calibrateThreshold() {
+// Returns false if a sensor drops or CALIBRATION_TIMEOUT passes before all samples arrive.
+// Existing averages/thresholds are left untouched in that case.
+bool calibrateThreshold() {
 
   uint8_t orangeLED = 12;
 
   for (int i = 0; i < targetSensorCount; i++) {
     sensors[i].digitalChar->writeValue(&orangeLED, 1);
-    sensorAverages[i] = 0;
   }
 
   if (COMMS) Serial.println("Starting Calibration");
 
+  uint16_t newAverages[MAX_SENSOR_COUNT] = { 0 };
   int samplesCollected[MAX_SENSOR_COUNT] = { 0 };
+  unsigned long calibrationStart = millis();
   while (true) {
     bool allDone = true;
     for (int i = 0; i < targetSensorCount; i++) {
       if (samplesCollected[i] < SIZE_OF_AVE) {
         allDone = false;
+        if (!sensors[i].client || !sensors[i].client->isConnected()) {
+          if (COMMS) Serial.println("Calibration aborted: sensor disconnected");
+          return false;
+        }
         if (newValueReady[i]) {
-          sensorAverages[i] += latestAnalogValues[i];
+          newAverages[i] += latestAnalogValues[i];
           newValueReady[i] = false;
           samplesCollected[i]++;
         }
       }
     }
     if (allDone) break;
+    if (millis() - calibrationStart > CALIBRATION_TIMEOUT) {
+      if (COMMS) Serial.println("Calibration aborted: timeout");
+      return false;
+    }
     delay(5);  //yield to allow BLE stack to deliver notifications
   }
 
   for (int i = 0; i < targetSensorCount; i++) {
+    sensorAverages[i] = newAverages[i];
     //default to mid-point sensitivity on fresh calibration
     setSensitivityBySensor(i, computeSensitivityOffset(50));
     sensitivityValues[i] = 50;
   }
+  return true;
 }
