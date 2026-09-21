@@ -95,6 +95,7 @@ console.log(`FIRMWARE_VERSION: ${oldVersion} -> ${newVersion}  (${bumpType} bump
 console.log(`COMMS:            ${oldComms} -> 0`);
 console.log(`Tag:              v${newVersion}`);
 console.log(`Push:             ${noPush ? 'no (--no-push)' : 'yes'}`);
+console.log(`After tag+push:   COMMS -> 1 again (written but left unstaged)`);
 
 if (dryRun) {
   console.log('\n--dry-run: nothing written, committed, tagged, or pushed.');
@@ -111,10 +112,17 @@ run(`git tag v${newVersion}`);
 if (!noPush) {
   run('git push origin HEAD');
   run(`git push origin v${newVersion}`);
-  console.log(`\nDone — v${newVersion} committed, tagged, and pushed. Check the Actions tab.`);
+  console.log(`\nv${newVersion} committed, tagged, and pushed. Check the Actions tab.`);
 } else {
-  console.log(`\nDone — v${newVersion} committed and tagged locally. Push manually when ready:`);
+  console.log(`\nv${newVersion} committed and tagged locally. Push manually when ready:`);
   console.log(`  git push origin HEAD && git push origin v${newVersion}`);
 }
 
-console.log(`\nReminder: COMMS is now 0. Flip it back to 1 in ${relPath} for your next debug session.`);
+// ─── Flip COMMS back to 1 for continued dev — written to disk only, left
+// unstaged. Not committed: that's a deliberate choice so the tag/release
+// commit stays exactly "the version bump," nothing more.
+console.log('\nFlipping COMMS back to 1 (unstaged)...');
+let postContent = fs.readFileSync(firmwareFile, 'utf8');
+postContent = postContent.replace(/#define\s+COMMS\s+\d+/, '#define COMMS 1');
+fs.writeFileSync(firmwareFile, postContent, 'utf8');
+console.log('Done.');
