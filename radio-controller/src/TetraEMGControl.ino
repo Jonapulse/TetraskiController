@@ -44,6 +44,7 @@ SensorBLE sensors[MAX_SENSOR_COUNT];
 int targetSensorCount = MIN_SENSOR_COUNT;  //2 or 4, set by num active sensors detected at boot
 volatile bool slotActive[MAX_SENSOR_COUNT] = { false }; 
 volatile bool sensorSubscribed[MAX_SENSOR_COUNT] = { false };  //true once the slot's notifications are routed to that slot's callback
+volatile bool skiLinkPaused = false;
 String slotMAC[MAX_SENSOR_COUNT];                            //MAC each slot held when the current baseline was established
 unsigned long lastSensorGainMs = 0;                          //when the most recent sensor finished connecting
 
@@ -364,7 +365,9 @@ void loop() {
 
   char cmd;
   while (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
-    handleCommand(cmd);
+    if(!skiLinkPaused){ //We still read the command if ski link is paused, but discard it
+      handleCommand(cmd);
+    }
   }
 
 #if ENABLE_PHONE_PERIPHERAL
@@ -377,6 +380,9 @@ void loop() {
   }
 
   readAndPrintSensors();
+
+  checkSkiVersionPeriodic(); //TEMP REMOVE FOR FINISHED VERSION - building block for ski version update
+  checkSkiUpdateModeBench();
 
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
   if (sensorDisconnectFlagged) {
@@ -437,10 +443,14 @@ void readAndPrintSensors() {
       if (i == 2) {
         if (millis() - lastWedgeActivation > WEDGE_OUTPUT_FREQ && currentDirection > 0) {
           lastWedgeActivation = millis();
-          Serial.print(currentDirection);
+          if(!skiLinkPaused){ //if ski link is paused, we throw out the value we'd send
+            Serial.print(currentDirection);
+          }
         }
       } else {
-        Serial.print(currentDirection);
+        if(!skiLinkPaused){ //if ski link is paused, we throw out the value we'd send
+          Serial.print(currentDirection);
+        }
       }
 
       // Broadcast sensor data to phone if connected.
@@ -542,7 +552,7 @@ void handleCommand(char cmd) {
 
   // Everything except phone disconnect and clear-save needs connected, calibrated sensors,
   // and is ignored during OTA so a blocking command (calibration) can't overrun the OTA queue.
-  if ((!sensorsReady || otaBusy()) && cmd != 'x' && cmd != 'z') {
+  if ((!sensorsReady || otaBusy() || skiLinkPaused) && cmd != 'x' && cmd != 'z') {
     sensCmdState = SENS_CMD_IDLE;
     if (COMMS) Serial.println("Sensors not ready or OTA in progress, ignoring command");
     return;
