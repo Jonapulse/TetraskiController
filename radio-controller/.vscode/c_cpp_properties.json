@@ -710,6 +710,7 @@
                 "PLATFORMIO=60118",
                 "ARDUINO_ESP32_DEV",
                 "CONFIG_BT_NIMBLE_MAX_CONNECTIONS=5",
+                "SKI_BENCH_COMMIT=1",
                 "ESP32_ARDUINO_LIB_BUILDER",
                 "ESP_MDNS_VERSION_NUMBER=\"1.9.1\"",
                 "ESP_PLATFORM",

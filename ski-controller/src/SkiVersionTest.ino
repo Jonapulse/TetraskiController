@@ -3,8 +3,16 @@
 //   Step 1: version query ('V' -> [lengthByte][ASCII version]).
 //   Step 2: enter/exit update mode handshake.
 //   Step 3: receive an image into FlasherX's buffer, verify it (CRC32 and
-//           target ID), then discard it. Nothing is committed to program
-//           flash in this step, flash_move() is never called.
+//           target ID), then discard it.
+//   Step 4: COMMIT. After the image is verified the radio can send COMMIT,
+//           and flash_move() rewrites program flash from the buffer and
+//           reboots into the new firmware. This is the one step that can
+//           leave the ski without working firmware if power is lost.
+//
+// Two builds of this same sketch are used for the bench test (SKI_BENCH_BUILD
+// below). Build 1 goes on the Teensy over USB. Build 2 is converted to a .bin
+// and stored on the radio as the image to push. They differ only in version
+// string and blink speed, so a completed update is visible on the LED.
 //
 // Onboard LED patterns:
 //   1 s blink ............ normal mode, sketch alive
@@ -27,6 +35,7 @@
 //                CHUNK 0x11 (seq u16 LE, then image bytes)
 //                END   0x12 (verify what was received)
 //                ABORT 0x13 (discard the buffer)
+//                COMMIT 0x14 (size u32 LE, crc32 u32 LE, must match the verified image)
 //   Status: ACK 0x06 (arg = seq for CHUNK, else 0), NAK 0x15 (arg = error code)
 // Raw ENTER (0x01) and EXIT (0x05) bytes keep working from step 2, but only
 // between frames and only while no image buffer is open, so a data byte that
@@ -40,7 +49,16 @@ extern "C" {
 #define SKI_CMD_ENTER_UPDATE   0x01
 #define SKI_CMD_EXIT_UPDATE    0x05
 #define SKI_ACK                0x06
-#define SKI_FIRMWARE_VERSION   "0.1.0-bench"
+
+// 1 = installed over USB, 2 = the image the radio pushes
+#define SKI_BENCH_BUILD 2
+#if SKI_BENCH_BUILD == 1
+  #define SKI_FIRMWARE_VERSION  "0.1.0-bench"
+  #define HEARTBEAT_INTERVAL_MS 1000
+#else
+  #define SKI_FIRMWARE_VERSION  "0.2.0-bench"
+  #define HEARTBEAT_INTERVAL_MS 300
+#endif
 
 #define SKI_UPDATE_IDLE_TIMEOUT_MS 10000  // no bytes this long in update mode -> leave it
 
@@ -52,6 +70,7 @@ extern "C" {
 #define FT_CHUNK  0x11
 #define FT_END    0x12
 #define FT_ABORT  0x13
+#define FT_COMMIT 0x14
 
 #define RS_ACK  0x06
 #define RS_NAK  0x15
@@ -68,8 +87,9 @@ extern "C" {
 #define ERR_WRONG_TARGET  0x0A
 
 #define LED_PIN LED_BUILTIN
-#define HEARTBEAT_INTERVAL_MS        1000
 #define UPDATE_HEARTBEAT_INTERVAL_MS 100
+
+const char* skiFirmwareVersion = SKI_FIRMWARE_VERSION;
 
 unsigned long lastHeartbeatMs = 0;
 bool heartbeatState = false;
@@ -235,6 +255,7 @@ void processFrame() {
     case FT_CHUNK: handleChunk(); break;
     case FT_END:   handleEnd();   break;
     case FT_ABORT: handleAbort(); break;
+    case FT_COMMIT: handleCommit(); break;
     default:       sendReply(RS_NAK, ERR_STATE); break;
   }
 }
@@ -328,6 +349,23 @@ void handleAbort() {
   sendReply(RS_ACK, 0);
 }
 
+// Rewrites program flash from the verified buffer and reboots. Every check
+// below has to pass first, because after flash_move() starts there is no
+// going back: the old firmware is being overwritten sector by sector.
+void handleCommit() {
+  if (rxLen != 8) { sendReply(RS_NAK, ERR_LENGTH); return; }
+  if (!bufferActive || !imageVerified) { sendReply(RS_NAK, ERR_STATE); return; }
+  if (readU32(rxPayload) != imgSize) { sendReply(RS_NAK, ERR_VERIFY_SIZE); return; }
+  if (readU32(rxPayload + 4) != imgCrc) { sendReply(RS_NAK, ERR_VERIFY_CRC); return; }
+  if (crc32OfBuffer(bufAddr, imgSize) != imgCrc) { sendReply(RS_NAK, ERR_VERIFY_CRC); return; }  // one last look at what is stored
+
+  sendReply(RS_ACK, 0);
+  Serial2.flush();  // the ACK must be on the wire before the UART goes away
+  Serial2.end();    // no UART interrupts while program flash is being rewritten
+
+  flash_move(FLASH_BASE_ADDR, bufAddr, imgSize);  // erases and rewrites program flash, then reboots, does not return
+}
+
 void leaveUpdateMode(bool timedOut) {
   updateMode = false;
   rxState = RX_IDLE;
@@ -346,9 +384,9 @@ void leaveUpdateMode(bool timedOut) {
 }
 
 void sendVersionResponse() {
-  uint8_t len = strlen(SKI_FIRMWARE_VERSION);
+  uint8_t len = strlen(skiFirmwareVersion);
   Serial2.write(len);
-  Serial2.write((const uint8_t*)SKI_FIRMWARE_VERSION, len);
+  Serial2.write((const uint8_t*)skiFirmwareVersion, len);
 }
 
 void flashConfirmation(int times) {

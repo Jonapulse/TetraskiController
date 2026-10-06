@@ -381,7 +381,7 @@ void loop() {
 
   readAndPrintSensors();
 
-  //checkSkiVersionPeriodic(); //TEMP REMOVE FOR FINISHED VERSION - building block for ski version update
+  checkSkiVersionPeriodic(); //TEMP REMOVE FOR FINISHED VERSION - building block for ski version update
   checkSkiUpdateModeBench();
 
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
