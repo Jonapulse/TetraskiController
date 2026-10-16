@@ -9,3 +9,5 @@ build/
 # PlatformIO auto-generated (local paths baked in)
 .vscode/c_cpp_properties.json
 .vscode/launch.json
+# Output of scripts/publish-release.js
+dist/

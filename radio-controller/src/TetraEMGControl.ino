@@ -330,7 +330,7 @@ void scanAndConnectSensors(bool isReconnect) {
 
   sensorDisconnectFlagged = false;  //cleared here so a drop from this point on is caught, by calibration or by loop()
 
-  Serial.print('$');  // Signal successful connection to ski
+  if (!skiLinkPaused) Serial.print('$');  // Signal successful connection to ski
 
   //skip calibration if these are the sensors we already have a baseline for
   bool haveBaseline = isReconnect ? sameSensorsAsBaseline() : loadAndMatchSettings();
@@ -357,11 +357,14 @@ void scanAndConnectSensors(bool isReconnect) {
 // RUNTIME LOOP
 // --------------------------------------------------
 void loop() {
-  //check for incoming comms from TetraSki
-  if (Serial.available()) {
+  //check for incoming comms from TetraSki (not while skiLinkService() is waiting on a reply from the ski)
+  if (!skiLinkBusy() && Serial.available()) {
     char incomingByte = Serial.read();
     handleCommand(incomingByte);
   }
+
+  // After the read above: starting a new exchange clears the receive buffer
+  skiLinkService();  // ski version query and firmware relay, see SkiUpdateService.ino
 
   char cmd;
   while (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
@@ -375,14 +378,11 @@ void loop() {
 #endif
 
   if (!sensorsReady) {
-    if (!otaBusy()) scanAndConnectSensors(sensorsReconnect);  //no scanning during OTA, loop() must stay fast
+    if (!otaBusy() && !skiRelayBusy()) scanAndConnectSensors(sensorsReconnect);  //no scanning during OTA or a ski relay, loop() must stay fast
     return;
   }
 
   readAndPrintSensors();
-
-  checkSkiVersionPeriodic(); //TEMP REMOVE FOR FINISHED VERSION - building block for ski version update
-  checkSkiUpdateModeBench();
 
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
   if (sensorDisconnectFlagged) {
@@ -602,34 +602,34 @@ void handleCommand(char cmd) {
     case '3':
       sensorOutputs[0] = 1;
       sensorOutputs[1] = 2;
-      Serial.print('c');
+      if (!skiLinkPaused) Serial.print('c');
       saveSettings();
       break;
 
     case '4':
       sensorOutputs[0] = 2;
       sensorOutputs[1] = 1;
-      Serial.print('c');
+      if (!skiLinkPaused) Serial.print('c');
       saveSettings();
       break;
 
     case '5':
-      Serial.print('c');
+      if (!skiLinkPaused) Serial.print('c');
       if (calibrateThreshold()) saveSettings();
-      Serial.print('f');
+      if (!skiLinkPaused) Serial.print('f');
       break;
 
     case 'g':
       sensorOutputs[2] = 3;
       sensorOutputs[3] = 4;
-      Serial.print('c');
+      if (!skiLinkPaused) Serial.print('c');
       saveSettings();
       break;
 
     case 'h':
       sensorOutputs[2] = 4;
       sensorOutputs[3] = 3;
-      Serial.print('c');
+      if (!skiLinkPaused) Serial.print('c');
       saveSettings();
       break;
 
@@ -660,7 +660,7 @@ void handleCommand(char cmd) {
       prefs.clear();
       prefs.end();
       if (COMMS) Serial.println("NVS settings cleared");
-      Serial.print('c');  // confirmation byte to TetraSki
+      if (!skiLinkPaused) Serial.print('c');  // confirmation byte to TetraSki
       break;
   }
 }
@@ -977,7 +977,7 @@ void applySensitivity(uint8_t sensorIndex, uint8_t rawValue) {
     Serial.println(sensOffset);
   }
 
-  Serial.print('c');  //send confirmation byte to TetraSki
+  if (!skiLinkPaused) Serial.print('c');  //send confirmation byte to TetraSki
   saveSettings();
 }
 

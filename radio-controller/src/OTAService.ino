@@ -3,6 +3,10 @@
 //
 // Provides a dedicated GATT service for receiving firmware images over BLE,
 // verifying them, and applying them via the ESP32 Update library.
+//
+// The same chunk path also carries a ski controller image. That one is
+// written to LittleFS instead of the OTA partition, and a separate command
+// has the radio relay it to the ski (see SkiUpdateService.ino).
 
 #include <NimBLEDevice.h>
 #include <Update.h>
@@ -14,11 +18,13 @@
 #define OTA_DATA_CHAR_UUID     "ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9"
 #define OTA_STATUS_CHAR_UUID   "5c8b02e7-5520-468f-bcba-fcc5093da1c9"
 #define OTA_VERSION_CHAR_UUID  "c82f2a3c-f48c-4cfa-b447-0277467898e4"
+#define OTA_SKI_VERSION_CHAR_UUID "f937d204-2a79-423d-bddf-e8530aafe87b"
 
 // ---- Tunables (most speedup rn on App.js end)
 #define OTA_CHUNK_PAYLOAD_MAX  512
 #define OTA_QUEUE_LEN          10      // backpressure depth before we flag an error
 #define OTA_IDLE_TIMEOUT_MS    15000   // ms with no activity before auto-abort
+#define OTA_SKI_VERSION_MAX    32      // longest ski version string a START may carry
 
 // ---- State machine ----
 enum OTAState {
@@ -31,6 +37,9 @@ enum OTAState {
 
 static volatile OTAState otaState = OTA_ST_IDLE;
 static volatile bool otaStartPending = false;  // START received on the BLE host task, Update.begin() not run yet
+static volatile bool otaTargetSki = false;     // this transfer is a ski image for LittleFS, not radio firmware
+static volatile bool otaSkiAbortPending = false;  // ABORT of a ski transfer, handled on the main task which owns the file
+static char otaSkiVersion[OTA_SKI_VERSION_MAX + 1] = "";
 
 struct OTAChunk {
   uint16_t seq;
@@ -48,12 +57,17 @@ static uint16_t otaExpectedSeq       = 0;
 static unsigned long otaLastActivityMs = 0;
 
 static NimBLECharacteristic* pOTAStatusChar = nullptr;
+static NimBLECharacteristic* pSkiVersionChar = nullptr;
 
 // ---- Status codes sent over the OTA Status characteristic ----
 enum OTAStatusCode : uint8_t {
   OTA_STATUS_READY     = 0x01, // ack for START
   OTA_STATUS_PROGRESS  = 0x02, // followed by 4-byte bytesWritten (uint32 LE)
   OTA_STATUS_DONE       = 0x03, // update applied, about to reboot
+  OTA_STATUS_SKI_STORED = 0x04, // ski image written to LittleFS and CRC verified, no reboot
+  OTA_STATUS_SKI_RELAY_PROGRESS = 0x10, // followed by phase(1), bytesSent(uint32 LE), bytesTotal(uint32 LE)
+  OTA_STATUS_SKI_RELAY_OK       = 0x11, // followed by the ski's new version (ASCII)
+  OTA_STATUS_SKI_RELAY_FAIL     = 0x12, // followed by reason(1), skiNak(1), known(1), the ski's old version (ASCII)
   OTA_STATUS_ERR_SIZE   = 0xE0, // requested size too large for OTA partition
   OTA_STATUS_ERR_SEQ    = 0xE1, // out-of-order / dropped chunk
   OTA_STATUS_ERR_CRC    = 0xE2, // CRC mismatch after full transfer
@@ -77,9 +91,55 @@ static void sendOTAProgress() {
   pOTAStatusChar->notify();
 }
 
+// ---- Ski relay reports, called from SkiUpdateService.ino ----
+
+void sendSkiRelayProgress(uint8_t phase, uint32_t bytesSent, uint32_t bytesTotal) {
+  if (!pOTAStatusChar) return;
+  uint8_t payload[10];
+  payload[0] = OTA_STATUS_SKI_RELAY_PROGRESS;
+  payload[1] = phase;
+  memcpy(&payload[2], &bytesSent, 4);
+  memcpy(&payload[6], &bytesTotal, 4);
+  pOTAStatusChar->setValue(payload, 10);
+  pOTAStatusChar->notify();
+}
+
+void sendSkiRelayOk(const char* newVersion) {
+  if (!pOTAStatusChar) return;
+  uint8_t payload[1 + OTA_SKI_VERSION_MAX];
+  size_t len = strnlen(newVersion, OTA_SKI_VERSION_MAX);
+  payload[0] = OTA_STATUS_SKI_RELAY_OK;
+  memcpy(&payload[1], newVersion, len);
+  pOTAStatusChar->setValue(payload, 1 + len);
+  pOTAStatusChar->notify();
+}
+
+// reason: a SkiUpdateResult value. skiNak: the ski's last NAK code, 0 if none.
+// known: true if the ski is known to be running oldVersion, false if there is
+// no telling what it runs now.
+void sendSkiRelayFail(uint8_t reason, uint8_t skiNak, bool known, const char* oldVersion) {
+  if (!pOTAStatusChar) return;
+  uint8_t payload[4 + OTA_SKI_VERSION_MAX];
+  size_t len = strnlen(oldVersion, OTA_SKI_VERSION_MAX);
+  payload[0] = OTA_STATUS_SKI_RELAY_FAIL;
+  payload[1] = reason;
+  payload[2] = skiNak;
+  payload[3] = known ? 1 : 0;
+  memcpy(&payload[4], oldVersion, len);
+  pOTAStatusChar->setValue(payload, 4 + len);
+  pOTAStatusChar->notify();
+}
+
+// Cached ski version for the phone to read, empty while unknown.
+void setSkiVersionChar(const char* version) {
+  if (!pSkiVersionChar) return;
+  pSkiVersionChar->setValue((const uint8_t*)version, strlen(version));
+}
+
 static void otaReset() {
   otaState = OTA_ST_IDLE;
   otaStartPending = false;
+  otaTargetSki = false;
   otaExpectedSize = 0;
   otaExpectedCRC = 0;
   otaBytesWritten = 0;
@@ -93,7 +153,7 @@ static void otaReset() {
 }
 
 // --------------------------------------------------
-// Control characteristic: handles START / ABORT / END
+// Control characteristic: handles START / ABORT / END, and the ski relay command
 // --------------------------------------------------
 class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
@@ -104,8 +164,12 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
 
     switch (cmd) {
 
+      // 'K' is the ski image START: 'K' + size(4 LE) + crc32(4 LE) + version (ASCII, 1 to 32 chars).
+      // A different letter instead of extra bytes on 'S', so older firmware
+      // rejects it and cannot mistake a ski image for its own.
+      case 'K':
       case 'S': { // START: 'S' + size(4 LE) + crc32(4 LE)  -> 9 bytes total
-        if (otaState != OTA_ST_IDLE || otaStartPending) {
+        if (otaState != OTA_ST_IDLE || otaStartPending || skiRelayBusy()) {
           sendOTAStatus(OTA_STATUS_ERR_STATE);
           return;
         }
@@ -113,6 +177,16 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
           sendOTAStatus(OTA_STATUS_ERR_STATE); // malformed START
           return;
         }
+        if (cmd == 'K') {
+          size_t verLen = value.size() - 9;
+          if (verLen == 0 || verLen > OTA_SKI_VERSION_MAX) {
+            sendOTAStatus(OTA_STATUS_ERR_STATE);
+            return;
+          }
+          memcpy(otaSkiVersion, value.data() + 9, verLen);
+          otaSkiVersion[verLen] = '\0';
+        }
+        otaTargetSki = (cmd == 'K');
 
         memcpy(&otaExpectedSize, value.data() + 1, 4);
         memcpy(&otaExpectedCRC,  value.data() + 5, 4);
@@ -136,6 +210,10 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
 
       case 'A': { // ABORT
         if (COMMS) Serial.println("OTA: ABORT received");
+        if (otaTargetSki) {
+          otaSkiAbortPending = true;
+          break;
+        }
         if (otaState != OTA_ST_IDLE) {
           Update.abort();
         }
@@ -153,6 +231,15 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
         // Verification runs in processOTAQueue() once the queue has fully
         // drained, so otaBytesWritten reflects every chunk queued before
         // this END command arrived.
+        break;
+      }
+
+      case 'R': { // RELAY: send the stored ski image to the ski. Progress and the result arrive as status notifications.
+        if (otaBusy() || skiRelayBusy()) {
+          sendOTAStatus(OTA_STATUS_ERR_STATE);
+          return;
+        }
+        skiRelayRequest();
         break;
       }
 
@@ -241,6 +328,14 @@ void setupOTAService(NimBLEServer* pServer) {
     NIMBLE_PROPERTY::READ
   );
   pVersionChar->setValue((uint8_t*)FIRMWARE_VERSION, strlen(FIRMWARE_VERSION));
+
+  // The ski's version as last reported to the radio, kept current by
+  // SkiUpdateService.ino. Empty until the ski has answered.
+  pSkiVersionChar = pOTAService->createCharacteristic(
+    OTA_SKI_VERSION_CHAR_UUID,
+    NIMBLE_PROPERTY::READ
+  );
+  pSkiVersionChar->setValue((const uint8_t*)"", 0);
 }
 
 // --------------------------------------------------
@@ -262,10 +357,23 @@ bool otaBusy() {
 void processOTAQueue() {
   OTAChunk chunk;
 
+  if (otaSkiAbortPending) {
+    otaSkiAbortPending = false;
+    skiStoreAbort();
+    otaReset();
+  }
+
   if (otaStartPending) {
     otaStartPending = false;
 
-    if (!Update.begin(otaExpectedSize)) {
+    if (otaTargetSki) {
+      int rc = skiStoreBegin(otaExpectedSize);
+      if (rc != 0) {
+        sendOTAStatus(rc == -2 ? OTA_STATUS_ERR_SIZE : OTA_STATUS_ERR_BEGIN);
+        otaReset();
+        return;
+      }
+    } else if (!Update.begin(otaExpectedSize)) {
       if (COMMS) {
         Serial.print("OTA: Update.begin() failed: ");
         Serial.println(Update.errorString());
@@ -286,7 +394,8 @@ void processOTAQueue() {
 
   while (xQueueReceive(otaQueue, &chunk, 0) == pdTRUE) {
 
-    if (otaState != OTA_ST_RECEIVING) break; // aborted/errored mid-drain
+    // Chunks queued before END still have to be written, so VERIFYING keeps draining
+    if (otaState != OTA_ST_RECEIVING && otaState != OTA_ST_VERIFYING) break; // aborted/errored mid-drain
 
     if (chunk.seq != otaExpectedSeq) {
       if (COMMS) {
@@ -300,8 +409,10 @@ void processOTAQueue() {
       break;
     }
 
-    if (Update.write(chunk.data, chunk.len) != chunk.len) {
-      if (COMMS) {
+    bool written = otaTargetSki ? skiStoreWrite(chunk.data, chunk.len)
+                                : Update.write(chunk.data, chunk.len) == chunk.len;
+    if (!written) {
+      if (COMMS && !otaTargetSki) {
         Serial.print("OTA: Update.write() failed: ");
         Serial.println(Update.errorString());
       }
@@ -337,7 +448,17 @@ void processOTAQueue() {
       }
       otaState = OTA_ST_ERROR;
       sendOTAStatus(OTA_STATUS_ERR_CRC);
-      Update.abort();
+      if (otaTargetSki) skiStoreAbort();
+      else Update.abort();
+      return;
+    }
+
+    if (otaTargetSki) {
+      // The running CRC above covers what arrived over BLE. skiStoreFinish()
+      // reads the file back, so this also covers what actually landed in flash.
+      bool stored = skiStoreFinish(otaExpectedSize, otaExpectedCRC, otaSkiVersion);
+      sendOTAStatus(stored ? OTA_STATUS_SKI_STORED : OTA_STATUS_ERR_CRC);
+      otaReset();
       return;
     }
 
@@ -364,7 +485,8 @@ void processOTAQueue() {
   if ((otaState == OTA_ST_RECEIVING || otaState == OTA_ST_ERROR) &&
       (millis() - otaLastActivityMs > OTA_IDLE_TIMEOUT_MS)) {
     if (COMMS) Serial.println("OTA: idle timeout, resetting state");
-    if (otaState == OTA_ST_RECEIVING) Update.abort();
+    if (otaTargetSki) skiStoreAbort();
+    else if (otaState == OTA_ST_RECEIVING) Update.abort();
     otaReset();
   }
 }

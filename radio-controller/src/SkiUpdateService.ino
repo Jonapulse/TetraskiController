@@ -1,13 +1,16 @@
 // SkiUpdateService.ino
 // -------------------------------------------------------------------------
 // Ski controller firmware update pathway (radio side).
-//   Step 1: version query round trip over the Serial link to the ski.
-//   Step 2: enter/exit update mode handshake.
-//   Step 3: send an image stored in LittleFS to the ski, which buffers and
-//           verifies it. The bench test then discards it.
-//   Step 4: with SKI_BENCH_COMMIT set to 1, compare versions and, if the
-//           stored image is newer, send it, COMMIT it, and watch the ski come
-//           back on the new version. Once per boot, never retried.
+//   - Version query: asks the ski for its version until it answers, and keeps
+//     the answer cached for the phone to read.
+//   - Image store: the phone sends a ski image over the BLE OTA chunk path
+//     (see OTAService.ino), it is written to LittleFS and read back to check it.
+//   - Relay: on the phone's command, send the stored image to the ski, COMMIT
+//     it, and watch the ski come back on the new version. One attempt, never
+//     retried.
+//
+// Nothing here blocks. skiLinkService() is called every loop() and moves one
+// small step each time, so sensors, BLE and the phone keep being serviced.
 //
 // Raw bytes (outside update-mode frames):
 //   0x56 'V'  version query, ski replies [lengthByte][ASCII chars]
@@ -29,20 +32,14 @@
 
 #define SKI_VERSION_TIMEOUT_MS   500
 #define SKI_VERSION_MAX_LEN      32
+#define SKI_VERSION_POLL_MS      5000   // how often to ask while the ski's version is unknown
 
 #define SKI_HANDSHAKE_TIMEOUT_MS 300
 #define SKI_HANDSHAKE_RETRIES    3
 
 #define SKI_FW_PATH              "/ski_fw.bin"
 #define SKI_FW_VER_PATH          "/ski_fw.ver"   // one line of text, e.g. 0.2.0-bench
-
-// 0 = the step 3 bench (send, verify, discard, every 2 minutes). Nothing is
-//     ever written to the ski's program flash.
-// 1 = the real update, once per boot. This REWRITES the ski's program flash.
-// Can also be set with build_flags = -DSKI_BENCH_COMMIT=1
-#ifndef SKI_BENCH_COMMIT
-#define SKI_BENCH_COMMIT 0
-#endif
+#define SKI_FS_MARGIN_BYTES      8192   // LittleFS needs spare blocks for its own bookkeeping
 
 #define SKI_SOF                  0xA5
 #define SKI_MAX_PAYLOAD          255
@@ -65,144 +62,91 @@
 #define SKI_COMMIT_TIMEOUT_MS    3000   // the ski ACKs before it starts rewriting flash
 #define SKI_REBOOT_WAIT_MS       15000  // how long to wait for the ski to answer after COMMIT
 
-#define SKI_BENCH_FIRST_RUN_MS   20000
-#define SKI_BENCH_CYCLE_MS       120000
+#define SKI_PREPARE_STEP_BYTES   1024   // image bytes checked per loop() before the relay starts
+#define SKI_PROGRESS_EVERY       16     // chunks between progress reports to the phone
 
-enum SkiXferResult : uint8_t {
-  SKI_XFER_OK = 0,
-  SKI_XFER_NO_FS,
-  SKI_XFER_NO_FILE,
-  SKI_XFER_START_FAILED,
-  SKI_XFER_CHUNK_FAILED,
-  SKI_XFER_END_FAILED
-};
-
-static const char* const skiXferNames[] = {
-  "OK", "NO_FS", "NO_FILE", "START_FAILED", "CHUNK_FAILED", "END_FAILED"
-};
-
-static uint8_t  skiLastNak = 0;      // last NAK code the ski sent, 0 if none
-static uint32_t skiXferBytes = 0;    // image bytes the ski has acknowledged
-static uint32_t skiRetryCount = 0;   // frames that had to be sent again, a measure of line quality
-static uint32_t skiImageSize = 0;    // size and CRC32 of the image last sent, needed for COMMIT
-static uint32_t skiImageCrc = 0;
-
+// Sent to the phone as the reason byte of a failed relay, App.js has the same list.
 enum SkiUpdateResult : uint8_t {
-  SKI_UPD_UPDATED = 0,        // the ski now reports the image's version
-  SKI_UPD_UP_TO_DATE,         // the ski already runs this version or newer
-  SKI_UPD_NO_SKI_VERSION,     // the ski never answered the version query, nothing attempted
-  SKI_UPD_NO_IMAGE_VERSION,   // /ski_fw.ver missing or unreadable, nothing attempted
+  SKI_UPD_UPDATED = 0,          // the ski now reports the image's version
+  SKI_UPD_UP_TO_DATE,           // the ski already runs this version or newer
+  SKI_UPD_NO_SKI_VERSION,       // the ski never answered the version query, nothing attempted
+  SKI_UPD_NO_IMAGE_VERSION,     // /ski_fw.ver missing or unreadable, nothing attempted
   SKI_UPD_ENTER_FAILED,
-  SKI_UPD_TRANSFER_FAILED,    // the ski still runs its old firmware
-  SKI_UPD_COMMIT_REJECTED,    // the ski refused to commit, still runs its old firmware
-  SKI_UPD_NO_RESPONSE,        // COMMIT went out, but the ski never answered afterwards
-  SKI_UPD_VERSION_MISMATCH    // the ski answers, but not with the image's version
+  SKI_UPD_TRANSFER_FAILED,      // the ski still runs its old firmware
+  SKI_UPD_COMMIT_REJECTED,      // the ski refused to commit, still runs its old firmware
+  SKI_UPD_NO_RESPONSE,          // COMMIT went out, but the ski never answered afterwards
+  SKI_UPD_VERSION_MISMATCH,     // the ski answers, but not with the image's version
+  SKI_UPD_NO_IMAGE,             // /ski_fw.bin missing or empty, nothing attempted
+  SKI_UPD_VERSION_NOT_IN_IMAGE  // the stored image does not contain its own version string, nothing attempted
 };
 
-static const char* const skiUpdateNames[] = {
-  "UPDATED", "UP_TO_DATE", "NO_SKI_VERSION", "NO_IMAGE_VERSION", "ENTER_FAILED",
-  "TRANSFER_FAILED", "COMMIT_REJECTED", "NO_RESPONSE", "VERSION_MISMATCH"
+// Sent to the phone with each progress report, App.js has the same list.
+enum SkiRelayPhase : uint8_t {
+  SKI_PHASE_PREPARE = 1,
+  SKI_PHASE_ENTER,
+  SKI_PHASE_SEND,
+  SKI_PHASE_VERIFY,
+  SKI_PHASE_COMMIT,
+  SKI_PHASE_REBOOT
 };
 
-// Blocks (with timeout) waiting for the ski controller's version reply.
-// Response framing: [lengthByte][ASCII chars].
-// Returns the version string, or "" if no valid response arrived in time.
-// Bench only: blocks the calling task for up to ~1 second.
-String querySkiVersion() {
-  while (Serial.available()) Serial.read();
+// ---- One exchange with the ski at a time: send something, collect the reply ----
+enum SkiOpKind : uint8_t { SKI_OP_NONE, SKI_OP_VERSION, SKI_OP_RAW, SKI_OP_FRAME };
+enum SkiOpResult : uint8_t { SKI_OP_PENDING, SKI_OP_OK, SKI_OP_NAK, SKI_OP_TIMEOUT };
 
-  Serial.write(SKI_CMD_VERSION_QUERY);
+static uint8_t  skiOpKind = SKI_OP_NONE;
+static uint8_t  skiOpBuf[3 + SKI_MAX_PAYLOAD + 2];   // the bytes being sent, kept for retries
+static uint16_t skiOpLen = 0;
+static unsigned long skiOpTimeoutMs = 0;
+static unsigned long skiOpGapMs = 0;      // quiet time before a retry
+static uint8_t  skiOpSendsLeft = 0;       // retries still allowed
+static bool     skiOpInGap = false;
+static unsigned long skiOpMarkMs = 0;     // when the current send (or gap) started
+static uint8_t  skiOpRx[SKI_VERSION_MAX_LEN + 1];
+static uint8_t  skiOpRxGot = 0;
+static uint8_t  skiOpRxWant = 0;          // version reply length, 0 until the length byte arrives
+static String   skiOpVersion;             // result of the last version query that was answered
 
-  unsigned long start = millis();
-  while (!Serial.available()) {
-    if (millis() - start > SKI_VERSION_TIMEOUT_MS) {
-      if (COMMS) Serial.println("Ski version query: timed out waiting for length byte");
-      return "";
-    }
-  }
+static uint8_t  skiLastNak = 0;           // last NAK code the ski sent, 0 if none
 
-  uint8_t len = Serial.read();
-  if (len == 0 || len > SKI_VERSION_MAX_LEN) {
-    if (COMMS) Serial.println("Ski version query: invalid length byte");
-    return "";
-  }
+// ---- Relay state ----
+enum SkiRelayState : uint8_t {
+  SKI_RLY_IDLE,
+  SKI_RLY_PREPARE,   // CRC32 of the stored image, and look for its version string in it
+  SKI_RLY_ENTER,
+  SKI_RLY_START,
+  SKI_RLY_CHUNK,
+  SKI_RLY_END,
+  SKI_RLY_COMMIT,
+  SKI_RLY_REBOOT,    // version queries until the ski answers
+  SKI_RLY_CONFIRM,   // ask again if the answer was not the image's version
+  SKI_RLY_ABORT,
+  SKI_RLY_EXIT
+};
 
-  char buf[SKI_VERSION_MAX_LEN + 1];
-  uint8_t received = 0;
-  start = millis();
-  while (received < len) {
-    if (Serial.available()) {
-      buf[received++] = Serial.read();
-    } else if (millis() - start > SKI_VERSION_TIMEOUT_MS) {
-      if (COMMS) Serial.println("Ski version query: timed out mid-string");
-      return "";
-    }
-  }
-  buf[received] = '\0';
+static uint8_t  skiRelayState = SKI_RLY_IDLE;
+static volatile bool skiRelayRequested = false;   // set on the BLE host task, picked up by loop()
+static File     skiRelayFile;
+static uint32_t skiImageSize = 0;    // size and CRC32 of the image being relayed, needed for COMMIT
+static uint32_t skiImageCrc = 0;
+static uint32_t skiRelayBytes = 0;   // image bytes checked (PREPARE) or acknowledged by the ski (CHUNK)
+static uint16_t skiRelaySeq = 0;
+static uint8_t  skiRelayChunkLen = 0;
+static uint8_t  skiRelayFailReason = 0;   // reported once ABORT and EXIT are done
+static uint8_t  skiRelayConfirmsLeft = 0;
+static unsigned long skiRelayMarkMs = 0;
+static String   skiRelayImgVer;
+static String   skiRelayNewVer;
+static bool     skiPrepFound = false;
+static size_t   skiPrepKeep = 0;     // tail of the previous block, so a version string split across two blocks is still found
+static uint8_t  skiPrepBuf[SKI_VERSION_MAX_LEN + SKI_PREPARE_STEP_BYTES];
 
-  if (COMMS) {
-    Serial.print("Ski version query: got \"");
-    Serial.print(buf);
-    Serial.println("\"");
-  }
-  return String(buf);
-}
+static String   skiVersion;          // cached ski version, "" while unknown
+static File     skiStoreFile;        // image being received from the phone
 
-// Bench call site: version check every 5 seconds while the link is in normal mode.
-void checkSkiVersionPeriodic() {
-  if (skiLinkPaused) return;
-
-  static unsigned long lastCheckMs = 0;
-  if (millis() - lastCheckMs < 5000) return;
-  lastCheckMs = millis();
-
-  String skiVer = querySkiVersion();
-  if (skiVer.length() > 0) {
-    Serial.print("Ski controller version: ");
-    Serial.println(skiVer);
-  } else {
-    Serial.println("Ski controller: no response");
-  }
-}
-
-// Discards other bytes until an ACK arrives or the timeout passes.
-static bool waitForSkiAck(unsigned long timeoutMs) {
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    if (Serial.available() && Serial.read() == SKI_ACK) return true;
-  }
-  return false;
-}
-
-// Stops all control output to the ski, then asks it to enter update mode.
-// Control output stays stopped on success. On failure it resumes, after a
-// best-effort EXIT in case the ski entered update mode and only its ACK was lost.
-bool enterSkiUpdateMode() {
-  skiLinkPaused = true;
-  Serial.flush();  // let bytes already queued for the ski finish going out
-
-  for (int attempt = 0; attempt < SKI_HANDSHAKE_RETRIES; attempt++) {
-    while (Serial.available()) Serial.read();
-    Serial.write(SKI_CMD_ENTER_UPDATE);
-    if (waitForSkiAck(SKI_HANDSHAKE_TIMEOUT_MS)) return true;
-  }
-
-  Serial.write(SKI_CMD_EXIT_UPDATE);
-  skiLinkPaused = false;
-  return false;
-}
-
-// Asks the ski to leave update mode, then resumes control output whether or
-// not the ACK arrived (the ski also leaves update mode on its own idle timeout).
-bool exitSkiUpdateMode() {
-  bool acked = false;
-  for (int attempt = 0; attempt < SKI_HANDSHAKE_RETRIES && !acked; attempt++) {
-    while (Serial.available()) Serial.read();
-    Serial.write(SKI_CMD_EXIT_UPDATE);
-    acked = waitForSkiAck(SKI_HANDSHAKE_TIMEOUT_MS);
-  }
-  skiLinkPaused = false;
-  return acked;
+static void skiSetVersion(const String& version) {
+  skiVersion = version;
+  setSkiVersionChar(version.c_str());
 }
 
 // CRC-16/CCITT-FALSE, same as the ski side
@@ -217,118 +161,114 @@ static uint16_t skiCrc16(const uint8_t* data, size_t len) {
   return crc;
 }
 
-// Sends one frame and waits for the ski's 6-byte reply. Returns true if a
-// reply with a good CRC arrived, with its status and argument filled in.
-static bool skiTransact(uint8_t type, const uint8_t* payload, uint8_t len,
-                        uint8_t* status, uint16_t* arg, unsigned long timeoutMs) {
-  uint8_t frame[3 + SKI_MAX_PAYLOAD + 2];
-  frame[0] = SKI_SOF;
-  frame[1] = type;
-  frame[2] = len;
-  if (len > 0) memcpy(frame + 3, payload, len);
-  uint16_t crc = skiCrc16(frame + 1, 2 + len);
-  frame[3 + len] = crc & 0xFF;
-  frame[4 + len] = crc >> 8;
-
+static void skiOpSend() {
   while (Serial.available()) Serial.read();
-  Serial.write(frame, 5 + len);
+  Serial.write(skiOpBuf, skiOpLen);
+  skiOpRxGot = 0;
+  skiOpRxWant = 0;
+  skiOpInGap = false;
+  skiOpMarkMs = millis();
+}
 
-  uint8_t reply[6];
-  uint8_t got = 0;
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    if (!Serial.available()) {
-      delay(1);
-      continue;
-    }
+// sends = how many times the bytes in skiOpBuf may go out in total
+static void skiOpBegin(uint8_t kind, uint16_t len, unsigned long timeoutMs, uint8_t sends, unsigned long gapMs) {
+  skiOpKind = kind;
+  skiOpLen = len;
+  skiOpTimeoutMs = timeoutMs;
+  skiOpSendsLeft = sends - 1;
+  skiOpGapMs = gapMs;
+  skiOpSend();
+}
+
+// Version reply framing: [lengthByte][ASCII chars]
+static void skiStartVersionQuery() {
+  skiOpBuf[0] = SKI_CMD_VERSION_QUERY;
+  skiOpBegin(SKI_OP_VERSION, 1, SKI_VERSION_TIMEOUT_MS, 1, 0);
+}
+
+// ENTER or EXIT. Other bytes are discarded until the ski's ACK arrives.
+static void skiStartRaw(uint8_t cmd) {
+  skiOpBuf[0] = cmd;
+  skiOpBegin(SKI_OP_RAW, 1, SKI_HANDSHAKE_TIMEOUT_MS, SKI_HANDSHAKE_RETRIES, 0);
+}
+
+// One update-mode frame, answered by the ski's 6-byte reply.
+static void skiStartFrame(uint8_t type, const uint8_t* payload, uint8_t len, unsigned long timeoutMs, uint8_t sends) {
+  skiOpBuf[0] = SKI_SOF;
+  skiOpBuf[1] = type;
+  skiOpBuf[2] = len;
+  if (len > 0) memcpy(skiOpBuf + 3, payload, len);
+  uint16_t crc = skiCrc16(skiOpBuf + 1, 2 + len);
+  skiOpBuf[3 + len] = crc & 0xFF;
+  skiOpBuf[4 + len] = crc >> 8;
+  skiOpBegin(SKI_OP_FRAME, 5 + len, timeoutMs, sends, SKI_RETRY_GAP_MS);
+}
+
+static uint8_t skiOpFinish(uint8_t result) {
+  skiOpKind = SKI_OP_NONE;
+  return result;
+}
+
+// Sends again if a retry is left, otherwise the exchange ends with the given result.
+static uint8_t skiOpRetry(uint8_t resultIfSpent) {
+  if (skiOpSendsLeft == 0) return skiOpFinish(resultIfSpent);
+  skiOpSendsLeft--;
+  if (skiOpGapMs == 0) {
+    skiOpSend();
+  } else {
+    skiOpInGap = true;
+    skiOpMarkMs = millis();
+  }
+  return SKI_OP_PENDING;
+}
+
+// Moves the current exchange along without waiting. Returns a SkiOpResult value.
+// A frame is retried on a timeout or a frame-CRC NAK, any other NAK is final
+// and its code is left in skiLastNak.
+static uint8_t skiOpPoll() {
+  if (skiOpInGap) {
+    if (millis() - skiOpMarkMs >= skiOpGapMs) skiOpSend();
+    return SKI_OP_PENDING;
+  }
+
+  // Bytes are read before the timeout is checked: a reply that arrived while
+  // loop() was busy elsewhere is sitting in the UART buffer and still counts.
+  while (Serial.available()) {
     uint8_t b = Serial.read();
-    if (got == 0 && b != SKI_SOF) continue;  // hunt for the start of a reply
-    reply[got++] = b;
-    if (got == 6) {
-      uint16_t rc = skiCrc16(reply + 1, 3);
-      if (rc == (uint16_t)(reply[4] | (reply[5] << 8))) {
-        *status = reply[1];
-        *arg = reply[2] | (reply[3] << 8);
-        return true;
+
+    if (skiOpKind == SKI_OP_VERSION) {
+      if (skiOpRxWant == 0) {
+        if (b == 0 || b > SKI_VERSION_MAX_LEN) return skiOpFinish(SKI_OP_TIMEOUT);
+        skiOpRxWant = b;
+        skiOpMarkMs = millis();
+      } else {
+        skiOpRx[skiOpRxGot++] = b;
+        if (skiOpRxGot == skiOpRxWant) {
+          skiOpRx[skiOpRxGot] = '\0';
+          skiOpVersion = String((const char*)skiOpRx);
+          return skiOpFinish(SKI_OP_OK);
+        }
       }
-      got = 0;  // corrupted reply, keep hunting until the timeout
+
+    } else if (skiOpKind == SKI_OP_RAW) {
+      if (b == SKI_ACK) return skiOpFinish(SKI_OP_OK);
+
+    } else {
+      if (skiOpRxGot == 0 && b != SKI_SOF) continue;  // hunt for the start of a reply
+      skiOpRx[skiOpRxGot++] = b;
+      if (skiOpRxGot < 6) continue;
+      skiOpRxGot = 0;
+      uint16_t rc = skiCrc16(skiOpRx + 1, 3);
+      if (rc != (uint16_t)(skiOpRx[4] | (skiOpRx[5] << 8))) continue;  // corrupted reply, keep hunting until the timeout
+      if (skiOpRx[1] == SKI_RS_ACK) return skiOpFinish(SKI_OP_OK);
+      skiLastNak = skiOpRx[2];
+      if (skiLastNak != SKI_ERR_FRAME_CRC) return skiOpFinish(SKI_OP_NAK);
+      return skiOpRetry(SKI_OP_NAK);
     }
   }
-  return false;
-}
 
-// Sends a frame until the ski ACKs it. Retries on a timeout or a frame-CRC
-// NAK, any other NAK is final and its code is left in skiLastNak.
-static bool skiRequest(uint8_t type, const uint8_t* payload, uint8_t len, unsigned long timeoutMs) {
-  for (int attempt = 0; attempt < SKI_FRAME_RETRIES; attempt++) {
-    uint8_t status = 0;
-    uint16_t arg = 0;
-    if (attempt > 0) {
-      skiRetryCount++;
-      delay(SKI_RETRY_GAP_MS);
-    }
-    if (!skiTransact(type, payload, len, &status, &arg, timeoutMs)) continue;
-    if (status == SKI_RS_ACK) return true;
-    skiLastNak = (uint8_t)arg;
-    if (arg != SKI_ERR_FRAME_CRC) return false;
-  }
-  return false;
-}
-
-// Sends the image at path to the ski, which buffers it and verifies it.
-// Must be called with the ski already in update mode. Prints nothing.
-// On any failure the caller should send ABORT so the ski frees its buffer.
-uint8_t skiTransferImage(const char* path) {   // returns a SkiXferResult value
-  skiLastNak = 0;
-  skiXferBytes = 0;
-  skiRetryCount = 0;
-
-  if (!LittleFS.begin(false)) return SKI_XFER_NO_FS;
-  File f = LittleFS.open(path, "r");
-  if (!f || f.size() == 0) return SKI_XFER_NO_FILE;
-  uint32_t size = f.size();
-
-  uint32_t crc = 0;
-  uint8_t buf[SKI_CHUNK_DATA_BYTES];
-  while (f.available()) {
-    size_t n = f.read(buf, sizeof(buf));
-    if (n == 0) break;
-    crc = crc32_le(crc, buf, n);
-  }
-  f.seek(0);
-
-  skiImageSize = size;
-  skiImageCrc = crc;
-
-  uint8_t startPayload[8];
-  memcpy(startPayload, &size, 4);
-  memcpy(startPayload + 4, &crc, 4);
-  if (!skiRequest(SKI_FT_START, startPayload, 8, SKI_START_TIMEOUT_MS)) {
-    f.close();
-    return SKI_XFER_START_FAILED;
-  }
-
-  uint16_t seq = 0;
-  uint32_t sent = 0;
-  uint8_t payload[2 + SKI_CHUNK_DATA_BYTES];
-  while (sent < size) {
-    size_t n = f.read(payload + 2, SKI_CHUNK_DATA_BYTES);
-    if (n == 0) break;
-    payload[0] = seq & 0xFF;
-    payload[1] = seq >> 8;
-    if (!skiRequest(SKI_FT_CHUNK, payload, 2 + n, SKI_CHUNK_TIMEOUT_MS)) {
-      f.close();
-      return SKI_XFER_CHUNK_FAILED;
-    }
-    sent += n;
-    skiXferBytes = sent;
-    seq++;
-  }
-  f.close();
-  if (sent != size) return SKI_XFER_CHUNK_FAILED;
-
-  if (!skiRequest(SKI_FT_END, nullptr, 0, SKI_END_TIMEOUT_MS)) return SKI_XFER_END_FAILED;
-  return SKI_XFER_OK;
+  if (millis() - skiOpMarkMs > skiOpTimeoutMs) return skiOpRetry(SKI_OP_TIMEOUT);
+  return SKI_OP_PENDING;
 }
 
 // Reads the one-line image version from /ski_fw.ver. False if it is missing or empty.
@@ -359,105 +299,312 @@ static int skiCompareVersions(const String& a, const String& b) {
   return 0;
 }
 
-// The whole update, once: compare versions, send the image, COMMIT it, then
-// watch for the ski to come back. Returns a SkiUpdateResult. Blocks for the
-// whole thing, and prints nothing (the caller prints once control output has
-// resumed). After COMMIT only version queries are ever sent to the ski.
-static uint8_t skiRunUpdate(String* oldVer, String* imgVer, String* newVer, unsigned long* bootMs) {
-  *bootMs = 0;
+// --------------------------------------------------
+// Image store: called from processOTAQueue() in OTAService.ino, on the main task
+// --------------------------------------------------
 
-  for (int i = 0; i < 3 && oldVer->length() == 0; i++) *oldVer = querySkiVersion();
-  if (oldVer->length() == 0) return SKI_UPD_NO_SKI_VERSION;
-  if (!skiReadImageVersion(imgVer)) return SKI_UPD_NO_IMAGE_VERSION;
-  if (skiCompareVersions(*imgVer, *oldVer) <= 0) return SKI_UPD_UP_TO_DATE;
+// Returns 0 on success, -1 if the filesystem cannot be used, -2 if the image does not fit.
+int skiStoreBegin(uint32_t size) {
+  if (!LittleFS.begin(true)) return -1;  // true = format a partition that has never held a filesystem
 
-  if (!enterSkiUpdateMode()) return SKI_UPD_ENTER_FAILED;
+  // Removed before the new image is written, not overwritten: LittleFS keeps
+  // the old file's blocks until the new one is closed, and two images do not fit.
+  LittleFS.remove(SKI_FW_PATH);
+  LittleFS.remove(SKI_FW_VER_PATH);
 
-  if (skiTransferImage(SKI_FW_PATH) != SKI_XFER_OK) {
-    skiRequest(SKI_FT_ABORT, nullptr, 0, SKI_ABORT_TIMEOUT_MS);
-    exitSkiUpdateMode();
-    return SKI_UPD_TRANSFER_FAILED;
-  }
+  if (LittleFS.totalBytes() - LittleFS.usedBytes() < size + SKI_FS_MARGIN_BYTES) return -2;
 
-  // One attempt, no retries. If the ski refuses it is still running its old
-  // firmware. If the ACK is lost the ski may be rewriting its flash anyway,
-  // so that case falls through to the same wait as an ACK.
-  uint8_t commitPayload[8];
-  memcpy(commitPayload, &skiImageSize, 4);
-  memcpy(commitPayload + 4, &skiImageCrc, 4);
-  uint8_t status = 0;
-  uint16_t arg = 0;
-  if (skiTransact(SKI_FT_COMMIT, commitPayload, 8, &status, &arg, SKI_COMMIT_TIMEOUT_MS) &&
-      status != SKI_RS_ACK) {
-    skiLastNak = (uint8_t)arg;
-    skiRequest(SKI_FT_ABORT, nullptr, 0, SKI_ABORT_TIMEOUT_MS);
-    exitSkiUpdateMode();
-    return SKI_UPD_COMMIT_REJECTED;
-  }
-
-  unsigned long start = millis();
-  while (millis() - start < SKI_REBOOT_WAIT_MS) {
-    *newVer = querySkiVersion();
-    if (newVer->length() > 0) {
-      *bootMs = millis() - start;
-      break;
-    }
-  }
-  if (newVer->length() == 0) return SKI_UPD_NO_RESPONSE;
-
-  // A bit error in the reply must not look like a failed update, so ask again before giving up
-  for (int i = 0; i < 2 && skiCompareVersions(*newVer, *imgVer) != 0; i++) {
-    String again = querySkiVersion();
-    if (again.length() > 0) *newVer = again;
-  }
-  return skiCompareVersions(*newVer, *imgVer) == 0 ? SKI_UPD_UPDATED : SKI_UPD_VERSION_MISMATCH;
+  skiStoreFile = LittleFS.open(SKI_FW_PATH, "w");
+  return skiStoreFile ? 0 : -1;
 }
 
-// Bench call site, see SKI_BENCH_COMMIT. Called from loop() in TetraEMGControl.ino.
-void checkSkiUpdateModeBench() {
-#if SKI_BENCH_COMMIT
-  static bool done = false;
-  if (done || skiLinkPaused || millis() < SKI_BENCH_FIRST_RUN_MS) return;
-  done = true;
+bool skiStoreWrite(const uint8_t* data, size_t len) {
+  return skiStoreFile && skiStoreFile.write(data, len) == len;
+}
 
-  String oldVer, imgVer, newVer;
-  unsigned long bootMs = 0;
-  unsigned long startMs = millis();
-  uint8_t result = skiRunUpdate(&oldVer, &imgVer, &newVer, &bootMs);
+// Drops a partly received image, so a relay can never pick it up.
+void skiStoreAbort() {
+  if (skiStoreFile) skiStoreFile.close();
+  LittleFS.remove(SKI_FW_PATH);
+  LittleFS.remove(SKI_FW_VER_PATH);
+}
+
+// Closes the image, reads it back from flash to check its size and CRC32, and
+// only then writes the version file next to it.
+bool skiStoreFinish(uint32_t size, uint32_t expectedCrc, const char* version) {
+  skiStoreFile.close();
+
+  File f = LittleFS.open(SKI_FW_PATH, "r");
+  bool ok = f && f.size() == size;
+  uint32_t crc = 0;
+  while (ok && f.available()) {
+    size_t n = f.read(skiPrepBuf, sizeof(skiPrepBuf));
+    if (n == 0) break;
+    crc = crc32_le(crc, skiPrepBuf, n);
+  }
+  if (f) f.close();
+  ok = ok && crc == expectedCrc;
+
+  if (ok) {
+    File v = LittleFS.open(SKI_FW_VER_PATH, "w");
+    ok = v && v.print(version) == strlen(version);
+    if (v) v.close();
+  }
+  if (!ok) skiStoreAbort();
+  return ok;
+}
+
+// --------------------------------------------------
+// Relay
+// --------------------------------------------------
+
+// Ends the relay, resumes control output, and reports to the phone.
+static void skiRelayFinish(uint8_t result) {
+  if (skiRelayFile) skiRelayFile.close();
+  skiRelayState = SKI_RLY_IDLE;
   skiLinkPaused = false;
 
-  Serial.printf("Ski update: result=%s old=%s image=%s new=%s ski_nak=0x%02X boot_ms=%lu retries=%u time=%lums\n",
-                skiUpdateNames[result],
-                oldVer.length() ? oldVer.c_str() : "unknown",
-                imgVer.length() ? imgVer.c_str() : "unknown",
-                newVer.length() ? newVer.c_str() : "none",
-                skiLastNak, bootMs, (unsigned)skiRetryCount, millis() - startMs);
-#else
-  // Step 3 bench: every SKI_BENCH_CYCLE_MS (first run after SKI_BENCH_FIRST_RUN_MS)
-  // enter update mode, send /ski_fw.bin, have the ski verify it, tell the ski to
-  // discard it, and exit. Blocks for the whole transfer, which the real update
-  // path will not do. Results are printed only after control output has resumed.
-  static bool firstRun = true;
-  static unsigned long lastRunMs = 0;
-  if (skiLinkPaused) return;
-  if (millis() - lastRunMs < (firstRun ? SKI_BENCH_FIRST_RUN_MS : SKI_BENCH_CYCLE_MS)) return;
-  firstRun = false;
-
-  unsigned long startMs = millis();
-  bool entered = enterSkiUpdateMode();
-  uint8_t result = SKI_XFER_START_FAILED;
-  bool discarded = false;
-  bool exited = false;
-  if (entered) {
-    result = skiTransferImage(SKI_FW_PATH);
-    discarded = skiRequest(SKI_FT_ABORT, nullptr, 0, SKI_ABORT_TIMEOUT_MS);
-    exited = exitSkiUpdateMode();
+  if (result == SKI_UPD_UPDATED) {
+    skiSetVersion(skiRelayNewVer);
+    sendSkiRelayOk(skiRelayNewVer.c_str());
+    return;
   }
-  lastRunMs = millis();
 
-  Serial.printf("Ski transfer bench: enter=%s transfer=%s ski_nak=0x%02X bytes=%u retries=%u discard=%s exit=%s time=%lums\n",
-                entered ? "ok" : "FAILED", skiXferNames[result], skiLastNak,
-                (unsigned)skiXferBytes, (unsigned)skiRetryCount, discarded ? "ok" : "FAILED",
-                exited ? "ok" : "FAILED", lastRunMs - startMs);
-#endif
+  // The ski answered after COMMIT, so what it runs is known, it is just not the image
+  if (result == SKI_UPD_VERSION_MISMATCH) skiSetVersion(skiRelayNewVer);
+
+  // After COMMIT with no answer there is no telling what the ski is running.
+  // Every other failure happens before its program flash is touched.
+  bool known = skiVersion.length() > 0 && result != SKI_UPD_NO_RESPONSE;
+  sendSkiRelayFail(result, skiLastNak, known, skiVersion.c_str());
+
+  if (result == SKI_UPD_NO_RESPONSE) skiSetVersion("");  // back to asking until it answers
+}
+
+// Has the ski discard its buffer and leave update mode, then reports the failure.
+static void skiRelayAbort(uint8_t reason) {
+  skiRelayFailReason = reason;
+  skiStartFrame(SKI_FT_ABORT, nullptr, 0, SKI_ABORT_TIMEOUT_MS, SKI_FRAME_RETRIES);
+  skiRelayState = SKI_RLY_ABORT;
+}
+
+static void skiRelaySendChunk() {
+  uint8_t payload[2 + SKI_CHUNK_DATA_BYTES];
+  size_t n = skiRelayFile.read(payload + 2, SKI_CHUNK_DATA_BYTES);
+  if (n == 0) {
+    skiRelayAbort(SKI_UPD_TRANSFER_FAILED);
+    return;
+  }
+  payload[0] = skiRelaySeq & 0xFF;
+  payload[1] = skiRelaySeq >> 8;
+  skiRelayChunkLen = n;
+  skiStartFrame(SKI_FT_CHUNK, payload, 2 + n, SKI_CHUNK_TIMEOUT_MS, SKI_FRAME_RETRIES);
+  skiRelayState = SKI_RLY_CHUNK;
+}
+
+// The checks that need no traffic to the ski. Control output keeps running
+// until they have all passed.
+static void skiRelayBegin() {
+  skiLastNak = 0;
+  skiRelayNewVer = "";
+  skiRelayImgVer = "";
+
+  if (skiVersion.length() == 0) { skiRelayFinish(SKI_UPD_NO_SKI_VERSION); return; }
+  if (!skiReadImageVersion(&skiRelayImgVer)) { skiRelayFinish(SKI_UPD_NO_IMAGE_VERSION); return; }
+  if (skiCompareVersions(skiRelayImgVer, skiVersion) <= 0) { skiRelayFinish(SKI_UPD_UP_TO_DATE); return; }
+
+  skiRelayFile = LittleFS.open(SKI_FW_PATH, "r");
+  if (!skiRelayFile || skiRelayFile.size() == 0) { skiRelayFinish(SKI_UPD_NO_IMAGE); return; }
+
+  skiImageSize = skiRelayFile.size();
+  skiImageCrc = 0;
+  skiRelayBytes = 0;
+  skiPrepFound = false;
+  skiPrepKeep = 0;
+  skiRelayState = SKI_RLY_PREPARE;
+  sendSkiRelayProgress(SKI_PHASE_PREPARE, 0, skiImageSize);
+}
+
+// After COMMIT: the ski has answered a version query. Done if it is the
+// image's version. A bit error in the reply must not look like a failed
+// update, so ask again before giving up.
+static void skiRelayCheckNewVersion() {
+  if (skiCompareVersions(skiRelayNewVer, skiRelayImgVer) == 0) {
+    skiRelayFinish(SKI_UPD_UPDATED);
+  } else if (skiRelayConfirmsLeft > 0) {
+    skiRelayConfirmsLeft--;
+    skiStartVersionQuery();
+    skiRelayState = SKI_RLY_CONFIRM;
+  } else {
+    skiRelayFinish(SKI_UPD_VERSION_MISMATCH);
+  }
+}
+
+// One step of the relay per call.
+static void skiRelayStep() {
+  if (skiRelayState == SKI_RLY_PREPARE) {
+    size_t verLen = skiRelayImgVer.length();
+    size_t n = skiRelayFile.read(skiPrepBuf + skiPrepKeep, SKI_PREPARE_STEP_BYTES);
+    if (n > 0) {
+      skiImageCrc = crc32_le(skiImageCrc, skiPrepBuf + skiPrepKeep, n);
+      skiRelayBytes += n;
+      size_t have = skiPrepKeep + n;
+      if (!skiPrepFound && memmem(skiPrepBuf, have, skiRelayImgVer.c_str(), verLen) != nullptr) skiPrepFound = true;
+      skiPrepKeep = have < verLen - 1 ? have : verLen - 1;
+      memmove(skiPrepBuf, skiPrepBuf + have - skiPrepKeep, skiPrepKeep);
+      return;
+    }
+    if (skiRelayBytes != skiImageSize) { skiRelayFinish(SKI_UPD_NO_IMAGE); return; }
+    if (!skiPrepFound) { skiRelayFinish(SKI_UPD_VERSION_NOT_IN_IMAGE); return; }
+
+    // Stops all control output to the ski, then asks it to enter update mode
+    skiRelayFile.seek(0);
+    skiLinkPaused = true;
+    Serial.flush();  // let bytes already queued for the ski finish going out
+    skiStartRaw(SKI_CMD_ENTER_UPDATE);
+    skiRelayState = SKI_RLY_ENTER;
+    sendSkiRelayProgress(SKI_PHASE_ENTER, 0, skiImageSize);
+    return;
+  }
+
+  uint8_t r = skiOpPoll();
+  if (r == SKI_OP_PENDING) return;
+
+  switch (skiRelayState) {
+
+    case SKI_RLY_ENTER: {
+      if (r != SKI_OP_OK) {
+        // Best-effort EXIT in case the ski entered update mode and only its ACK was lost
+        Serial.write(SKI_CMD_EXIT_UPDATE);
+        skiRelayFinish(SKI_UPD_ENTER_FAILED);
+        return;
+      }
+      uint8_t startPayload[8];
+      memcpy(startPayload, &skiImageSize, 4);
+      memcpy(startPayload + 4, &skiImageCrc, 4);
+      skiStartFrame(SKI_FT_START, startPayload, 8, SKI_START_TIMEOUT_MS, SKI_FRAME_RETRIES);
+      skiRelayState = SKI_RLY_START;
+      break;
+    }
+
+    case SKI_RLY_START:
+      if (r != SKI_OP_OK) { skiRelayAbort(SKI_UPD_TRANSFER_FAILED); return; }
+      skiRelayBytes = 0;
+      skiRelaySeq = 0;
+      sendSkiRelayProgress(SKI_PHASE_SEND, 0, skiImageSize);
+      skiRelaySendChunk();
+      break;
+
+    case SKI_RLY_CHUNK:
+      if (r != SKI_OP_OK) { skiRelayAbort(SKI_UPD_TRANSFER_FAILED); return; }
+      skiRelayBytes += skiRelayChunkLen;
+      skiRelaySeq++;
+      if ((skiRelaySeq % SKI_PROGRESS_EVERY) == 0) sendSkiRelayProgress(SKI_PHASE_SEND, skiRelayBytes, skiImageSize);
+      if (skiRelayBytes < skiImageSize) {
+        skiRelaySendChunk();
+      } else {
+        skiStartFrame(SKI_FT_END, nullptr, 0, SKI_END_TIMEOUT_MS, SKI_FRAME_RETRIES);
+        skiRelayState = SKI_RLY_END;
+        sendSkiRelayProgress(SKI_PHASE_VERIFY, skiRelayBytes, skiImageSize);
+      }
+      break;
+
+    case SKI_RLY_END: {
+      if (r != SKI_OP_OK) { skiRelayAbort(SKI_UPD_TRANSFER_FAILED); return; }
+      // One attempt, no retries. If the ski refuses it is still running its old
+      // firmware. If the ACK is lost the ski may be rewriting its flash anyway,
+      // so that case falls through to the same wait as an ACK.
+      uint8_t commitPayload[8];
+      memcpy(commitPayload, &skiImageSize, 4);
+      memcpy(commitPayload + 4, &skiImageCrc, 4);
+      skiStartFrame(SKI_FT_COMMIT, commitPayload, 8, SKI_COMMIT_TIMEOUT_MS, 1);
+      skiRelayState = SKI_RLY_COMMIT;
+      sendSkiRelayProgress(SKI_PHASE_COMMIT, skiRelayBytes, skiImageSize);
+      break;
+    }
+
+    case SKI_RLY_COMMIT:
+      if (r == SKI_OP_NAK) { skiRelayAbort(SKI_UPD_COMMIT_REJECTED); return; }
+      // After COMMIT only version queries are ever sent to the ski
+      skiRelayMarkMs = millis();
+      skiRelayConfirmsLeft = 2;
+      skiStartVersionQuery();
+      skiRelayState = SKI_RLY_REBOOT;
+      sendSkiRelayProgress(SKI_PHASE_REBOOT, skiRelayBytes, skiImageSize);
+      break;
+
+    case SKI_RLY_REBOOT:
+      if (r == SKI_OP_OK) {
+        skiRelayNewVer = skiOpVersion;
+        skiRelayCheckNewVersion();
+      } else if (millis() - skiRelayMarkMs < SKI_REBOOT_WAIT_MS) {
+        skiStartVersionQuery();
+      } else {
+        skiRelayFinish(SKI_UPD_NO_RESPONSE);
+      }
+      break;
+
+    case SKI_RLY_CONFIRM:
+      if (r == SKI_OP_OK) skiRelayNewVer = skiOpVersion;
+      skiRelayCheckNewVersion();
+      break;
+
+    case SKI_RLY_ABORT:
+      skiStartRaw(SKI_CMD_EXIT_UPDATE);
+      skiRelayState = SKI_RLY_EXIT;
+      break;
+
+    case SKI_RLY_EXIT:
+      // Control output resumes whether or not the ACK arrived (the ski also
+      // leaves update mode on its own idle timeout)
+      skiRelayFinish(skiRelayFailReason);
+      break;
+  }
+}
+
+// --------------------------------------------------
+// Public
+// --------------------------------------------------
+
+// Asks for a relay of the stored image. Safe to call from the BLE host task.
+void skiRelayRequest() {
+  skiRelayRequested = true;
+}
+
+// True from the phone's relay command until the result has been reported.
+bool skiRelayBusy() {
+  return skiRelayRequested || skiRelayState != SKI_RLY_IDLE;
+}
+
+// True while this file is waiting on bytes from the ski. loop() must leave
+// Serial alone then, or it would read a reply as a control command.
+bool skiLinkBusy() {
+  return skiOpKind != SKI_OP_NONE || skiRelayState != SKI_RLY_IDLE;
+}
+
+// Called every loop().
+void skiLinkService() {
+  if (skiRelayState != SKI_RLY_IDLE) {
+    skiRelayStep();
+    return;
+  }
+
+  if (skiOpKind == SKI_OP_VERSION) {
+    if (skiOpPoll() == SKI_OP_OK) skiSetVersion(skiOpVersion);
+    return;
+  }
+
+  if (skiRelayRequested) {
+    skiRelayRequested = false;
+    skiRelayBegin();
+    return;
+  }
+
+  // Until the ski has answered once, ask every few seconds. Runs with or
+  // without sensors connected.
+  static unsigned long lastQueryMs = 0;
+  if (skiVersion.length() == 0 && !otaBusy() && millis() - lastQueryMs >= SKI_VERSION_POLL_MS) {
+    lastQueryMs = millis();
+    skiStartVersionQuery();
+  }
 }
