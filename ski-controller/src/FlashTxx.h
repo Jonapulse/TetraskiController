@@ -62,7 +62,10 @@
   #define FLASH_SIZE		(0x800000)		// 8MB
   #define FLASH_SECTOR_SIZE	(0x1000)		// 4KB sector size
   #define FLASH_WRITE_SIZE	(4)			// 4-byte/32-bit writes    
-  #define FLASH_RESERVE		(4*FLASH_SECTOR_SIZE)	// reserve top of flash 
+  // TetraSki: the top 256KB holds EEPROM emulation (252KB) and the LED blink
+  // restore program (4KB). Reserving only 4 sectors let the buffer search
+  // mistake EEPROM data for the end of code, and flash_move() erase it.
+  #define FLASH_RESERVE		(64*FLASH_SECTOR_SIZE)	// reserve top of flash 
   #define FLASH_BASE_ADDR	(0x60000000)		// code starts here
 #elif defined(__IMXRT1062__) && defined(ARDUINO_TEENSY_MICROMOD)
   #define FLASH_ID		"fw_teensyMM"		// target ID (in code)
@@ -116,11 +119,9 @@ void LMEM_CodeCacheClearAll(void);
 
 RAMFUNC int flash_sector_not_erased( uint32_t address );
 
-// from cores\Teensy4\eeprom.c  --  use these functions at your own risk!!!
-void eepromemu_flash_write(void *addr, const void *data, uint32_t len);
-void eepromemu_flash_erase_sector(void *addr);
-void eepromemu_flash_erase_32K_block(void *addr);
-void eepromemu_flash_erase_64K_block(void *addr);
+// in FlashT4.c, copied from cores\Teensy4\eeprom.c  --  use these functions at your own risk!!!
+void flashtxx_t4_write(void *addr, const void *data, uint32_t len);
+void flashtxx_t4_erase_sector(void *addr);
 
 #endif // __IMXRT1062__
 

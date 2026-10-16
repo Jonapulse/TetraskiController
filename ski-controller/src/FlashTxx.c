@@ -264,7 +264,7 @@ RAMFUNC void flash_move( uint32_t dst, uint32_t src, uint32_t size )
     if ((addr & (FLASH_SECTOR_SIZE - 1)) == 0) {
       if (flash_sector_not_erased( addr )) {
         #if defined(__IMXRT1062__)
-          eepromemu_flash_erase_sector( (void *)addr );
+          flashtxx_t4_erase_sector( (void *)addr );
         #elif (FLASH_WRITE_SIZE==4)
           error |= flash_erase_sector( addr, 1 );
           if (addr == (0x40C & ~(FLASH_SECTOR_SIZE - 1)))
@@ -282,7 +282,7 @@ RAMFUNC void flash_move( uint32_t dst, uint32_t src, uint32_t size )
     #if defined(__IMXRT1062__)
       // for T4.x, data address passed to flash_write() must be in RAM
       uint32_t value = *(uint32_t *)(src + offset);     
-      eepromemu_flash_write( (void*)addr, &value, 4 );
+      flashtxx_t4_write( (void*)addr, &value, 4 );
     #elif (FLASH_WRITE_SIZE==4)
       error |= flash_word( addr, *(uint32_t *)(src + offset), 1, 0 );
     #elif (FLASH_WRITE_SIZE==8)
@@ -302,7 +302,7 @@ RAMFUNC void flash_move( uint32_t dst, uint32_t src, uint32_t size )
       if ((addr & (FLASH_SECTOR_SIZE - 1)) == 0) {
         if (flash_sector_not_erased( addr )) {
           #if defined(__IMXRT1062__)
-            eepromemu_flash_erase_sector( (void*)addr );
+            flashtxx_t4_erase_sector( (void*)addr );
           #else
             error |= flash_erase_sector( addr, 0 );
           #endif
@@ -330,7 +330,7 @@ int flash_erase_block( uint32_t start, uint32_t size )
     if ((address & (FLASH_SECTOR_SIZE - 1)) == 0) {
       if (flash_sector_not_erased( address )) {
 	#if defined(__IMXRT1062__)
-          eepromemu_flash_erase_sector( (void*)address );
+          flashtxx_t4_erase_sector( (void*)address );
         #elif defined(KINETISK) || defined(KINETISL)
           error = flash_erase_sector( address, 0 );
 	#endif
@@ -374,7 +374,7 @@ int flash_write_block( uint32_t addr, char *data, uint32_t count )
       continue;						//     continue while()
     }							//   
     #if defined(__IMXRT1062__)				//   #if T4.x 4-byte
-      eepromemu_flash_write((void*)addr,(void*)&buf,4);	//     flash_write()
+      flashtxx_t4_write((void*)addr,(void*)&buf,4);	//     flash_write()
     #elif (FLASH_WRITE_SIZE==4)				//   #elif T3.x 4-byte 
       ret = flash_word( addr, buf, 0, 0 );		//     flash_word()
     #elif (FLASH_WRITE_SIZE==8)				//   #elif T3.x 8-byte

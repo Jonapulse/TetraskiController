@@ -13,7 +13,7 @@
 // small step each time, so sensors, BLE and the phone keep being serviced.
 //
 // Raw bytes (outside update-mode frames):
-//   0x56 'V'  version query, ski replies [lengthByte][ASCII chars]
+//   0x56 'V'  version query, ski replies 'V' [major][minor][patch], each 1-255
 //   0x01      enter update mode, ski replies SKI_ACK
 //   0x05      exit update mode, ski replies SKI_ACK
 // Update-mode frames: see the header of SkiVersionTest.ino for the format.
@@ -32,6 +32,7 @@
 
 #define SKI_VERSION_TIMEOUT_MS   500
 #define SKI_VERSION_MAX_LEN      32
+#define SKI_VERSION_REPLY_LEN    4      // 'V' + major, minor, patch
 #define SKI_VERSION_POLL_MS      5000   // how often to ask while the ski's version is unknown
 
 #define SKI_HANDSHAKE_TIMEOUT_MS 300
@@ -60,7 +61,7 @@
 #define SKI_END_TIMEOUT_MS       3000   // ski reads the image back and checks CRC32
 #define SKI_ABORT_TIMEOUT_MS     10000  // ski erases the buffer
 #define SKI_COMMIT_TIMEOUT_MS    3000   // the ski ACKs before it starts rewriting flash
-#define SKI_REBOOT_WAIT_MS       15000  // how long to wait for the ski to answer after COMMIT
+#define SKI_REBOOT_WAIT_MS       30000  // how long to wait for the ski to answer after COMMIT (flash rewrite + its 10 s startUpSeq())
 
 #define SKI_PREPARE_STEP_BYTES   1024   // image bytes checked per loop() before the relay starts
 #define SKI_PROGRESS_EVERY       16     // chunks between progress reports to the phone
@@ -104,7 +105,6 @@ static bool     skiOpInGap = false;
 static unsigned long skiOpMarkMs = 0;     // when the current send (or gap) started
 static uint8_t  skiOpRx[SKI_VERSION_MAX_LEN + 1];
 static uint8_t  skiOpRxGot = 0;
-static uint8_t  skiOpRxWant = 0;          // version reply length, 0 until the length byte arrives
 static String   skiOpVersion;             // result of the last version query that was answered
 
 static uint8_t  skiLastNak = 0;           // last NAK code the ski sent, 0 if none
@@ -165,7 +165,6 @@ static void skiOpSend() {
   while (Serial.available()) Serial.read();
   Serial.write(skiOpBuf, skiOpLen);
   skiOpRxGot = 0;
-  skiOpRxWant = 0;
   skiOpInGap = false;
   skiOpMarkMs = millis();
 }
@@ -180,7 +179,7 @@ static void skiOpBegin(uint8_t kind, uint16_t len, unsigned long timeoutMs, uint
   skiOpSend();
 }
 
-// Version reply framing: [lengthByte][ASCII chars]
+// Version reply framing: 'V' [major][minor][patch], each byte 1-255
 static void skiStartVersionQuery() {
   skiOpBuf[0] = SKI_CMD_VERSION_QUERY;
   skiOpBegin(SKI_OP_VERSION, 1, SKI_VERSION_TIMEOUT_MS, 1, 0);
@@ -237,17 +236,15 @@ static uint8_t skiOpPoll() {
     uint8_t b = Serial.read();
 
     if (skiOpKind == SKI_OP_VERSION) {
-      if (skiOpRxWant == 0) {
-        if (b == 0 || b > SKI_VERSION_MAX_LEN) return skiOpFinish(SKI_OP_TIMEOUT);
-        skiOpRxWant = b;
-        skiOpMarkMs = millis();
-      } else {
-        skiOpRx[skiOpRxGot++] = b;
-        if (skiOpRxGot == skiOpRxWant) {
-          skiOpRx[skiOpRxGot] = '\0';
-          skiOpVersion = String((const char*)skiOpRx);
-          return skiOpFinish(SKI_OP_OK);
-        }
+      if (skiOpRxGot == 0 && b != SKI_CMD_VERSION_QUERY) return skiOpFinish(SKI_OP_TIMEOUT);
+      if (skiOpRxGot > 0 && b == 0) return skiOpFinish(SKI_OP_TIMEOUT);  // 0 is never a valid version number
+      skiOpRx[skiOpRxGot++] = b;
+      if (skiOpRxGot == SKI_VERSION_REPLY_LEN) {
+        // Kept as MAJOR.MINOR.PATCH text, the form the phone and the image's .ver file use
+        char text[12];
+        snprintf(text, sizeof(text), "%u.%u.%u", skiOpRx[1], skiOpRx[2], skiOpRx[3]);
+        skiOpVersion = String(text);
+        return skiOpFinish(SKI_OP_OK);
       }
 
     } else if (skiOpKind == SKI_OP_RAW) {

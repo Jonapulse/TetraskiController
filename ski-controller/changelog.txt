@@ -1,0 +1,134 @@
+v0.1.0
+-First port of software from TetraSki 1 hardware. 
+-Updated position calibration for newer in-line actuators
+-Added battery measurement functions
+-Added basic display functionality for 16x2 display
+
+v0.2.0
+-Minor bug fixes
+
+v1.0.0
+-First software version built for the final mainboard design - changed a few pins from previous version
+-Support for the newer 320x240 LCD display with basic stats readout
+
+v1.1.0
+-Added shutdown when joystick module unplugged
+-Changed single-press function of power button to cycle wedge modes
+-changed double-press function of power button to change difficulty settings
+-added two difficulty settings for joystick
+
+v1.1.1
+-Added lifetime stats stored in EEPROM (total runtime, runs, turn, etc)
+-added splash screen that displays HW #, usage stats mentioned above
+
+
+v2.0.0
+-Completely overhauled screen UI using Workshop4 IDE and Visi-Genie (see notes)
+-Added debugging screen that shows raw sensor output (5x press of main button)
+-Tweaked actuator speed settings to be more consistent (added super low-speed for debug)
+-Changed actuator acceleration to 12000 steps/s to improve response
+-Added advanced sip and puff modes
+-Added idle timeout to save battery in case user forgets to shut power off
+-Fixed bug that caused incorrect reporting of total runtime
+-Changed the way screen updates and position calibration occurs making it less resource heavy
+-Changed some variable names to be more descriptive
+-Rewrote battery update timer when ski sits idle - update battery values every 30 seconds
+-Added calibration menu - options to calibrate actuators and joystick
+-Calibration values are now stored in the EEPROM and updated when calibration functions are run
+-Changed how the position calibration is performed to eliminate floating point operations
+
+v2.1.0
+-Changed remote/ski ping to communicate current mode
+-Tweaked timing of advanced sip and puff mode to make mode changes easier
+
+v2.2.0
+-Overhauled ski kinematics for improved response time and smoother motion
+- Changed modes to the following:
+	1. Advanced Joystick - same as previous
+	2. Beginner Joystick - same as previous
+	3. Beginner Sip/Puff - same as previous
+	4. Advanced sip/puff - better timing for mode change, faster ski movement (2250 steps/s), ski chime for mode #
+-Added a moving average function to joystick inputs - smooths out ski motion with new control algorithm
+-Changed min step threshold for advanced joystick to 5
+-Changed min step threshold for beginner joystick to 25
+-Changed min step threshold for remote to 25
+-Improved low battery warning and added three 'tiers':
+	<20% - Audible chime clearable by single press of joy button
+	<10% - Audible chime, non-clearable
+	0% - Audible chime turns off, skis go into low power mode (200 steps/s)
+
+v2.2.1
+-Added new parameters for screen updates to only update screen when content has changed
+
+v2.3.0
+-Added support for new Teensy 4.1 (Build using Teensy41 env in Platformio)
+-Switched to the GenieArduinoDEV library for the screen - should solve issues w/ lag/glitching
+-Eliminated all delay() calls from calibration options to reduce screen comm glitches
+-Changed calibration rapid traverse speed to minimize stalling
+-Changed calibration sensitivy to increase success rate
+-Updated power on/off chime
+-Eliminate separate remote commands for lift mode activate/deactivate and instead invert current state
+	-Remote firmware continues to cycle values 222 -> 223 to maintain backwards compatibility
+-Single press of any button on remote exits lift mode
+-Dialed back Modes 1 & 2 to be slightly more aggressive - simulated Y positions of +60 and +30, respectively
+-Changed name of BEGINNER and ADVANCED mode to 'I' and 'O'
+-Changed the control mode display text to also show the current actuator speed
+-Changed wedge position readout on screen to display 'O' while in O control mode
+-Added new option to change actuator speed separately from 'difficulty' settings
+	-Actuator speed can be set via a menu accessed by pressing the power button 4 times
+	-Button presses will cycle through a SLOW, MEDIUM, FAST speed
+	-Changing 'difficuty' settings will always default to SLOW for beginner and FAST for advanced
+-Added a new option for mode change using sip/puff hardware
+	-Activate by entering actuator speed option screen, the DOUBLE PRESSING button again
+	-Sip increases wedge (increases mode) "sip slower"
+	-Puff decreases wedge (decreases mode) "puff faster"
+	-Functions like remote buttons and does not cycle from 4->1
+	-Emits audible chime on remote and ski
+-Added new option for an audible chime when remote control override engages/disengages
+	-Activate by entering actuator speed option screen, the TRIPLE PRESSING button
+	-Emits continuous chime when remote override is occuring
+-Changed remote response behavior - add 25ms delay to any remote response to mitigate interference issues
+-Disabled Sip & Puff while in 'I' (formerly Advanced) mode
+-Actuators now retract all the way in when ski is powered down
+-many, many bug fixes and misc backend improvements
+
+v2.3.1
+-Reduced FAST actuator speed back to 3000 steps/s to avoid stalling due to stepper torque dropoff
+-Changed button behavior to allow entering options menu, Lift mode, I/O mode while joystick is at a nonzero value
+
+v2.4.0 
+-Slightly expanded joystick "deadzone" to correct problem of some joysticks not returning to center
+-Removed all "wedge position changes" from O-mode to avoid confusion
+	-affects console button, remote, -S/P wedge change
+	-Remote now flashes single blink only when in O-Mode
+-Added radio/HWID programming function to the GUI so no USB programming is required
+	*menu is used for internal Tetradapt diagnostics and not intended to be public facing
+-Beta support of EMG/external control devices on SerialXB2
+	-simple latching left/right functionality to mimic S&P for initial release
+-Added basic dual Sip and Puff functionality for Teensy 4.1 devices
+	-single sip/puff decreases/increases current wedge position
+
+v2.5.0
+-tweaked the calibration routine to avoid problem of endless loop when actuator end point doesnt register correctly
+-split the options menu into two separate menus based on TetraSki microcontroller version:
+	-Teensy 3.2 - eliminates EMG menu option since the hardware doesn't support EMG control
+	-Teensy 4.1 - adds additional EMG options menu, removes S/P wedge change since it's redundant with two S/P ports
+-Power down with joystick pushed forward now straightens skis regardless of their current position
+-Changed actuator speed during lift mode lock/unlock to slow - gives actuators more power to overcome stall situations
+-Fixed bug causing remote to display as unpaired during display of options menu on ski
+-Fixed bug casing uneven beep length on mode changes performed through EMG or S/P
+-Changed long sip/puff timing for left port (500 -> 1000ms) to make wedge changes easier for users
+-added support for EMG wedge position change
+
+
+
+
+
+
+
+
+
+
+
+
+
