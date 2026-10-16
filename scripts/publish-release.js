@@ -3,7 +3,7 @@
  * Builds both firmwares and publishes ONE GitHub release with three assets:
  *   firmware.bin    radio controller image
  *   ski_fw.bin      ski controller image (raw binary, what the radio relays)
- *   manifest.json   {"radio":"1.0.9","ski":"0.2.0"}, what the app compares against
+ *   manifest.json   {"radio":"1.0.10","ski":"2.6.1"}, what the app compares against
  *
  * Plain Node (18 or newer), no dependencies, same as radio-controller/scripts/release.js.
  *
@@ -69,21 +69,16 @@ if (!radioMatch) fail('Could not find FIRMWARE_VERSION in TetraEMGControl.ino');
 const radioVersion = radioMatch[1];
 const comms = (radioSource.match(/#define\s+COMMS\s+(\d+)/) || [])[1];
 
-// The ski sketch may define its version once, or once per SKI_BENCH_BUILD
-// branch. Either way the result is checked against the built image below.
+// The ski's version is VERSION_MAJOR/MINOR/REV in main.cpp, the same numbers
+// it reports to the radio. Checked against the built image below.
 function readSkiVersion() {
-  const srcDir = path.join(SKI_DIR, 'src');
-  for (const file of fs.readdirSync(srcDir)) {
-    if (!/\.(ino|cpp|h)$/.test(file)) continue;
-    const text = fs.readFileSync(path.join(srcDir, file), 'utf8');
-    const versions = [...text.matchAll(/#define\s+SKI_FIRMWARE_VERSION\s+"([^"]+)"/g)].map(m => m[1]);
-    if (versions.length === 0) continue;
-    if (versions.length === 1) return versions[0];
-    const bench = text.match(/#define\s+SKI_BENCH_BUILD\s+(\d+)/);
-    if (bench && versions[Number(bench[1]) - 1]) return versions[Number(bench[1]) - 1];
-    fail(`${file} defines SKI_FIRMWARE_VERSION ${versions.length} times and it is not clear which one is built.`);
-  }
-  fail('Could not find SKI_FIRMWARE_VERSION in ski-controller/src');
+  const text = fs.readFileSync(path.join(SKI_DIR, 'src', 'main.cpp'), 'utf8');
+  const parts = ['MAJOR', 'MINOR', 'REV'].map(name => {
+    const m = text.match(new RegExp(`#define\\s+VERSION_${name}\\s+(\\d+)`));
+    if (!m) fail(`Could not find VERSION_${name} in ski-controller/src/main.cpp`);
+    return Number(m[1]);
+  });
+  return parts.join('.');
 }
 const skiVersion = readSkiVersion();
 
@@ -129,11 +124,11 @@ function run(cmd, cmdArgs, cwd) {
 
 if (!skipBuild) {
   run(pio, ['run'], RADIO_DIR);
-  run(pio, ['run'], SKI_DIR);
+  run(pio, ['run', '-e', 'teensy41'], SKI_DIR);  // the update path only exists on the Teensy 4.1 build
 }
 
 const radioBin = path.join(RADIO_DIR, '.pio', 'build', 'esp32dev', 'firmware.bin');
-const skiHex = path.join(SKI_DIR, '.pio', 'build', 'teensy40', 'firmware.hex');
+const skiHex = path.join(SKI_DIR, '.pio', 'build', 'teensy41', 'firmware.hex');
 if (!fs.existsSync(radioBin)) fail(`Missing ${radioBin}, build the radio first.`);
 if (!fs.existsSync(skiHex)) fail(`Missing ${skiHex}, build the ski controller first.`);
 
@@ -157,7 +152,7 @@ if (!radioImage.includes(Buffer.from(radioVersion, 'ascii'))) {
   fail(`firmware.bin does not contain the version string "${radioVersion}". Stale build?`);
 }
 if (!skiImage.includes(Buffer.from(skiVersion, 'ascii'))) {
-  fail(`ski_fw.bin does not contain the version string "${skiVersion}". Stale build, or the wrong SKI_BENCH_BUILD?`);
+  fail(`ski_fw.bin does not contain the version string "${skiVersion}". Stale build?`);
 }
 if (skiImage.length > SKI_IMAGE_MAX_BYTES) {
   fail(`ski_fw.bin is ${skiImage.length} bytes, the radio can store at most ${SKI_IMAGE_MAX_BYTES}.`);
