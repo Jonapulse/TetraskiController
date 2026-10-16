@@ -15,7 +15,7 @@ QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra ste
 //The chip performs the same across reboots for a simpler user experience.
 #define USE_USER_CONFIG 0 
 
-#define FIRMWARE_VERSION "1.0.9"
+#define FIRMWARE_VERSION "1.0.10"
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
