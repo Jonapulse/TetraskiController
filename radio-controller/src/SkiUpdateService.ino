@@ -63,6 +63,9 @@
 #define SKI_COMMIT_TIMEOUT_MS    3000   // the ski ACKs before it starts rewriting flash
 #define SKI_REBOOT_WAIT_MS       30000  // how long to wait for the ski to answer after COMMIT (flash rewrite + its 10 s startUpSeq())
 
+#define SKI_BATTERY_MAX_DIGITS   3      // ski battery report: '%' then 0-100 as ASCII
+#define SKI_BATTERY_WAIT_MS      5      // the ski writes the digits back to back, about 0.2 ms apart on the wire
+
 #define SKI_PREPARE_STEP_BYTES   1024   // image bytes checked per loop() before the relay starts
 #define SKI_PROGRESS_EVERY       16     // chunks between progress reports to the phone
 
@@ -236,6 +239,7 @@ static uint8_t skiOpPoll() {
     uint8_t b = Serial.read();
 
     if (skiOpKind == SKI_OP_VERSION) {
+      if (skiOpRxGot == 0 && b == '%') { consumeSkiBattery(); continue; }  // battery report sent just before the reply
       if (skiOpRxGot == 0 && b != SKI_CMD_VERSION_QUERY) return skiOpFinish(SKI_OP_TIMEOUT);
       if (skiOpRxGot > 0 && b == 0) return skiOpFinish(SKI_OP_TIMEOUT);  // 0 is never a valid version number
       skiOpRx[skiOpRxGot++] = b;
@@ -456,6 +460,7 @@ static void skiRelayStep() {
 
     // Stops all control output to the ski, then asks it to enter update mode
     skiRelayFile.seek(0);
+    sendIdleToSki();  // the last direction sent must not stay latched on the ski while it waits for ENTER
     skiLinkPaused = true;
     Serial.flush();  // let bytes already queued for the ski finish going out
     skiStartRaw(SKI_CMD_ENTER_UPDATE);
@@ -562,6 +567,23 @@ static void skiRelayStep() {
 // --------------------------------------------------
 // Public
 // --------------------------------------------------
+
+// The ski sends its battery as '%' followed by the percentage in 1 to 3 ASCII
+// digits (main.cpp updateBatteryStats()). Call right after reading the '%'.
+// The digits are read here so they never reach handleCommand(), where '3',
+// '4' and '5' invert controls and calibrate. Digits arriving more than
+// SKI_BATTERY_WAIT_MS after the '%' are left alone. The value is not kept yet.
+void consumeSkiBattery() {
+  uint8_t digits = 0;
+  unsigned long start = millis();
+  while (digits < SKI_BATTERY_MAX_DIGITS && millis() - start <= SKI_BATTERY_WAIT_MS) {
+    int c = Serial.peek();
+    if (c < 0) continue;              // next digit still on the wire
+    if (c < '0' || c > '9') break;    // not part of the battery report
+    Serial.read();
+    digits++;
+  }
+}
 
 // Asks for a relay of the stored image. Safe to call from the BLE host task.
 void skiRelayRequest() {

@@ -477,6 +477,8 @@ void processOTAQueue() {
 
     if (COMMS) Serial.println("OTA: Update.end() succeeded, rebooting");
     sendOTAStatus(OTA_STATUS_DONE);
+    sendIdleToSki();  // no direction output while the radio reboots
+    Serial.flush();
     delay(200); // let the notify flush before reboot
     ESP.restart();
   }
