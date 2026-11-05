@@ -15,11 +15,21 @@ QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra ste
 //The chip performs the same across reboots for a simpler user experience.
 #define USE_USER_CONFIG 0 
 
+<<<<<<< HEAD
 #define FIRMWARE_VERSION "1.0.10"
+=======
+#define FIRMWARE_VERSION "1.0.11"
+>>>>>>> main
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
 #define ENABLE_PHONE_PERIPHERAL 1
+
+// Where a handleCommand() byte came from. Each source keeps its own sensitivity-command
+// parse state, so a byte from the ski can't land in the middle of a command from the phone.
+#define CMD_SRC_SERIAL 0
+#define CMD_SRC_PHONE  1
+#define CMD_SRC_COUNT  2
 
 
 /************ BLE Sensor Stuff ************************************************/
@@ -360,7 +370,8 @@ void loop() {
   //check for incoming comms from TetraSki (not while skiLinkService() is waiting on a reply from the ski)
   if (!skiLinkBusy() && Serial.available()) {
     char incomingByte = Serial.read();
-    handleCommand(incomingByte);
+    if (incomingByte == '%') consumeSkiBattery();  // battery digits must not reach handleCommand(), see SkiUpdateService.ino
+    else handleCommand(incomingByte, CMD_SRC_SERIAL);
   }
 
   // After the read above: starting a new exchange clears the receive buffer
@@ -369,7 +380,11 @@ void loop() {
   char cmd;
   while (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
     if(!skiLinkPaused){ //We still read the command if ski link is paused, but discard it
+<<<<<<< HEAD
       handleCommand(cmd);
+=======
+      handleCommand(cmd, CMD_SRC_PHONE);
+>>>>>>> main
     }
   }
 
@@ -387,6 +402,7 @@ void loop() {
   // Checked here so reconnect happens from loop() rather than the BLE stack thread.
   if (sensorDisconnectFlagged) {
     if (COMMS) Serial.println("Sensor drop detected — reconnecting...");
+    sendIdleToSki();
     sensorsReady = false;
     sensorsReconnect = true;  // isReconnect=true: skips sort, uses saved MAC slots
   }
@@ -544,16 +560,21 @@ void readAndPrintSensors() {
 enum SensCmdState { SENS_CMD_IDLE,
                     SENS_CMD_WAIT_DIGIT1,
                     SENS_CMD_WAIT_DIGIT2 };
-SensCmdState sensCmdState = SENS_CMD_IDLE;
-uint8_t sensCmdSensorIndex = 0;
-uint8_t sensCmdDigit1 = 0;
+SensCmdState sensCmdState[CMD_SRC_COUNT] = { SENS_CMD_IDLE, SENS_CMD_IDLE };
+uint8_t sensCmdSensorIndex[CMD_SRC_COUNT] = { 0, 0 };
+uint8_t sensCmdDigit1[CMD_SRC_COUNT] = { 0, 0 };
 
-void handleCommand(char cmd) {
+// src is CMD_SRC_SERIAL or CMD_SRC_PHONE
+void handleCommand(char cmd, uint8_t src) {
 
   // Everything except phone disconnect and clear-save needs connected, calibrated sensors,
   // and is ignored during OTA so a blocking command (calibration) can't overrun the OTA queue.
   if ((!sensorsReady || otaBusy() || skiLinkPaused) && cmd != 'x' && cmd != 'z') {
+<<<<<<< HEAD
     sensCmdState = SENS_CMD_IDLE;
+=======
+    sensCmdState[src] = SENS_CMD_IDLE;
+>>>>>>> main
     if (COMMS) Serial.println("Sensors not ready or OTA in progress, ignoring command");
     return;
   }
@@ -561,42 +582,42 @@ void handleCommand(char cmd) {
   // Continue parsing a pending sensitivity command if one is in progress.
   // A non-digit byte where a digit is expected aborts the partial command;
   // that byte then falls through to be processed as a normal command below.
-  if (sensCmdState == SENS_CMD_WAIT_DIGIT1) {
+  if (sensCmdState[src] == SENS_CMD_WAIT_DIGIT1) {
     if (cmd >= '0' && cmd <= '9') {
-      sensCmdDigit1 = cmd - '0';
-      sensCmdState = SENS_CMD_WAIT_DIGIT2;
+      sensCmdDigit1[src] = cmd - '0';
+      sensCmdState[src] = SENS_CMD_WAIT_DIGIT2;
       return;
     }
-    sensCmdState = SENS_CMD_IDLE;
-  } else if (sensCmdState == SENS_CMD_WAIT_DIGIT2) {
+    sensCmdState[src] = SENS_CMD_IDLE;
+  } else if (sensCmdState[src] == SENS_CMD_WAIT_DIGIT2) {
     if (cmd >= '0' && cmd <= '9') {
-      uint8_t rawValue = sensCmdDigit1 * 10 + (cmd - '0');
-      applySensitivity(sensCmdSensorIndex, rawValue);
-      sensCmdState = SENS_CMD_IDLE;
+      uint8_t rawValue = sensCmdDigit1[src] * 10 + (cmd - '0');
+      applySensitivity(sensCmdSensorIndex[src], rawValue);
+      sensCmdState[src] = SENS_CMD_IDLE;
       return;
     }
-    sensCmdState = SENS_CMD_IDLE;
+    sensCmdState[src] = SENS_CMD_IDLE;
   }
 
   switch (cmd) {
     case 'l':
-      sensCmdSensorIndex = 0;
-      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      sensCmdSensorIndex[src] = 0;
+      sensCmdState[src] = SENS_CMD_WAIT_DIGIT1;
       break;
 
     case 'r':
-      sensCmdSensorIndex = 1;
-      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      sensCmdSensorIndex[src] = 1;
+      sensCmdState[src] = SENS_CMD_WAIT_DIGIT1;
       break;
 
     case 'u':
-      sensCmdSensorIndex = 2;
-      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      sensCmdSensorIndex[src] = 2;
+      sensCmdState[src] = SENS_CMD_WAIT_DIGIT1;
       break;
 
     case 'd':
-      sensCmdSensorIndex = 3;
-      sensCmdState = SENS_CMD_WAIT_DIGIT1;
+      sensCmdSensorIndex[src] = 3;
+      sensCmdState[src] = SENS_CMD_WAIT_DIGIT1;
       break;
 
     case '3':
@@ -643,6 +664,7 @@ void handleCommand(char cmd) {
       targetSensorCount = 4;
       saveSettings();
       if (activeSensorCount() < targetSensorCount) {
+        sendIdleToSki();
         sensorsReady = false;      //loop() runs the scan
         sensorsReconnect = true;  //reconnect = true boolean flagged so we don't resort the left/right sensor values
       }
@@ -665,6 +687,15 @@ void handleCommand(char cmd) {
   }
 }
 
+
+// --------------------------------------------------
+// The ski keeps acting on the last direction byte it received, so call this
+// anywhere direction output is about to stop (sensor drop, rescan, calibration,
+// ski update relay, reboot). Otherwise a turn in progress holds until output resumes.
+// --------------------------------------------------
+void sendIdleToSki() {
+  if (!skiLinkPaused) Serial.print('0');
+}
 
 // --------------------------------------------------
 // Sensor slot helpers
@@ -987,6 +1018,8 @@ void applySensitivity(uint8_t sensorIndex, uint8_t rawValue) {
 // Returns false if a sensor drops or CALIBRATION_TIMEOUT passes before all samples arrive.
 // Existing averages/thresholds are left untouched in that case.
 bool calibrateThreshold() {
+
+  sendIdleToSki();  // no direction output for the whole calibration (up to CALIBRATION_TIMEOUT)
 
   uint8_t orangeLED = 12;
 
