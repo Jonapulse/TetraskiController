@@ -402,7 +402,7 @@ void loop() {
       //   decreaseWedge(true);
       // }
 
-      if(sip.active==-1 || (EMG==49 && !emgControlMode)) {
+      if(sip.active==-1 || (EMG==1 && !emgControlMode)) {
 
         if(lSki>750 || (yS<0 && lSki>100)) {}     //Prevents skis from continuously "stuttering" at max range
 
@@ -413,7 +413,7 @@ void loop() {
           setPosition(xS, yS, 0, actuatorSpeed);
        }
 
-      } else if(sip.active==1 || (EMG==50 && !emgControlMode)) {
+      } else if(sip.active==1 || (EMG==2 && !emgControlMode)) {
 
         if(rSki>750 || (yS<0 && rSki>100)) {}  //Prevents skis from continuously "stuttering" at max range
 
@@ -425,7 +425,7 @@ void loop() {
         }
 
       // If sip/puff not detected stop skis in place
-      } else if((sip.active==0 && oldActive!=0) || (EMG==48 && oldEMG!=48 && !emgControlMode)) {
+      } else if((sip.active==0 && oldActive!=0) || (EMG==0 && oldEMG!=0 && !emgControlMode)) {
           stopSkis();
       }
 
@@ -1385,7 +1385,7 @@ void updateBatteryStats(bool forceUpdate) {
   batteryVoltage=((rawBattery/50)*.0414)+.7455;
   batteryPercentage=(((batteryVoltage)*(11.111)-355.56));
 
-
+//Test
   if(batteryPercentage>100)
     batteryPercentage=100;
 
@@ -1407,7 +1407,7 @@ void updateBatteryStats(bool forceUpdate) {
     battPercent.concat("%");
     display.WriteStr(4, battPercent);
 
-        SERIAL_XB2.print("%");
+    SERIAL_XB2.print("%");
     SERIAL_XB2.print(lowestBatteryPercentage);
     Serial.println("Sent Battery");
   }
