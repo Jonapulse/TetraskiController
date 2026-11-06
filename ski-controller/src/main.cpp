@@ -9,6 +9,11 @@
 #define VERSION_MINOR 6
 #define VERSION_REV 1
 
+// BENCH ONLY. 1 adds the test tools at the end of this file (serial bursts,
+// battery override, loop timing). Must be 0 for any release. Pair a bench ski
+// build only with a bench radio build.
+#define BENCH_TOOLS 1
+
 SKI_UPDATE_VERSION_TAG(VERSION_MAJOR, VERSION_MINOR, VERSION_REV);
 
 //Firmware version as text, e.g. "2.6.1"
@@ -225,6 +230,11 @@ void melodyGenerator();
 void sendRemoteResponse();
 void progRadio();
 void processBTCommands();
+#if BENCH_TOOLS
+bool benchParseByte(char c);
+void benchLoopTick();
+int benchReportedBattery();
+#endif
 
 
 
@@ -307,6 +317,10 @@ void setup() {
 
 
 void loop() {
+
+#if BENCH_TOOLS
+  benchLoopTick();  // loop timing and ski-side serial bursts
+#endif
 
   //Updating functions that need to run every loop
   setStatusLED();  //This is depreciated with non-illuminated buttons on new skis but exists for backwards compatibility
@@ -1399,7 +1413,11 @@ void updateBatteryStats(bool forceUpdate) {
     display.WriteStr(4, battPercent);
 
     SERIAL_XB2.print("%");
+#if BENCH_TOOLS
+    SERIAL_XB2.print(benchReportedBattery());
+#else
     SERIAL_XB2.print(lowestBatteryPercentage);
+#endif
     Serial.println("Sent Battery");
 
   } else if(forceUpdate) {
@@ -1408,7 +1426,11 @@ void updateBatteryStats(bool forceUpdate) {
     display.WriteStr(4, battPercent);
 
         SERIAL_XB2.print("%");
+#if BENCH_TOOLS
+    SERIAL_XB2.print(benchReportedBattery());
+#else
     SERIAL_XB2.print(lowestBatteryPercentage);
+#endif
     Serial.println("Sent Battery");
   }
 
@@ -2841,6 +2863,10 @@ void progRadio() {
 void processBTCommands() {
   char inChar = SERIAL_XB2.read();
 
+#if BENCH_TOOLS
+  if (benchParseByte(inChar)) return;  // bench commands relayed by a bench radio build
+#endif
+
   switch(inChar) {
     case '0':
       EMG=0;
@@ -2891,3 +2917,157 @@ void displayEventHandler(void)
 
 
 }
+
+
+#if BENCH_TOOLS
+//***********************************************************************************************************************
+// BENCH ONLY: test tools, compiled only with BENCH_TOOLS 1. Commands arrive from a
+// bench radio build on SERIAL_XB2:
+//   &S<size><ms>  send <size> filler bytes (2 digits, 00 = stop) to the radio every
+//                 <ms> ms (1 digit, 0 = every loop). Auto-stops after 30 s.
+//   *<nn>         report battery as nn% to the radio from now on (display and the
+//                 ski's own battery warnings keep using the real reading). Sent once
+//                 right away, then with every normal battery report. Until reboot.
+//   #             report loop timing to the radio and USB, then reset it.
+// Reports go to the radio as 0x81, text with the high bit set on every byte, 0x82,
+// so no byte of a report can be read as a command by any radio firmware.
+// Filler byte 0x80 is ignored by every radio firmware.
+
+#define BENCH_FILLER      0x80
+#define BENCH_TEXT_START  0x81
+#define BENCH_TEXT_END    0x82
+#define BENCH_BURST_MAX   99
+#define BENCH_BURST_LIMIT_MS 30000
+
+int benchBatteryOverride = -1;  // -1 = report the real reading
+
+uint8_t benchBurstSize = 0;     // 0 = no burst running
+uint8_t benchBurstIntervalMs = 0;
+unsigned long benchBurstStartMs = 0;
+unsigned long benchBurstLastMs = 0;
+uint32_t benchBurstCount = 0;
+uint32_t benchBurstMaxWriteUs = 0;
+uint8_t benchBurstBuf[BENCH_BURST_MAX];
+
+uint32_t benchLastLoopUs = 0;
+uint32_t benchMaxLoopUs = 0;      // longest loop() while a ski was moving
+uint32_t benchMovingLoops = 0;
+
+char benchCmd = 0;                // bench command being parsed, 0 if none
+char benchArg[4];
+uint8_t benchGot = 0;
+uint8_t benchNeed = 0;
+
+int benchReportedBattery() {
+  return benchBatteryOverride >= 0 ? benchBatteryOverride : lowestBatteryPercentage;
+}
+
+void benchSendText(const char* text) {
+  SERIAL_XB2.write(BENCH_TEXT_START);
+  for (const char* c = text; *c; c++) SERIAL_XB2.write((uint8_t)(*c | 0x80));
+  SERIAL_XB2.write(BENCH_TEXT_END);
+  Serial.print("Bench: ");
+  Serial.println(text);
+}
+
+// Sends loop timing and burst results with a label, then starts counting again.
+void benchReport(const char* label) {
+  char text[120];
+  snprintf(text, sizeof(text), "%s: loop max %lu us while moving (%lu loops), burst write max %lu us (%lu bursts), tx free %d",
+           label, (unsigned long)benchMaxLoopUs, (unsigned long)benchMovingLoops,
+           (unsigned long)benchBurstMaxWriteUs, (unsigned long)benchBurstCount, SERIAL_XB2.availableForWrite());
+  benchSendText(text);
+  benchMaxLoopUs = 0;
+  benchMovingLoops = 0;
+  benchBurstMaxWriteUs = 0;
+  benchBurstCount = 0;
+}
+
+void benchBurstStart(uint8_t size, uint8_t intervalMs) {
+  if (benchBurstSize > 0) {
+    benchBurstSize = 0;
+    benchReport("ski burst stopped");
+  }
+  if (size == 0) return;
+  memset(benchBurstBuf, BENCH_FILLER, sizeof(benchBurstBuf));
+  benchMaxLoopUs = 0;
+  benchMovingLoops = 0;
+  benchBurstMaxWriteUs = 0;
+  benchBurstCount = 0;
+  benchBurstIntervalMs = intervalMs;
+  benchBurstStartMs = millis();
+  benchBurstLastMs = 0;
+  benchBurstSize = size;
+  char text[60];
+  if (intervalMs == 0) snprintf(text, sizeof(text), "ski burst: %u bytes every loop, 30 s", size);
+  else snprintf(text, sizeof(text), "ski burst: %u bytes every %u ms, 30 s", size, intervalMs);
+  benchSendText(text);
+}
+
+// Called at the top of every loop().
+void benchLoopTick() {
+  uint32_t now = micros();
+  if (benchLastLoopUs != 0 && (leftSki.isRunning() || rightSki.isRunning())) {
+    uint32_t dt = now - benchLastLoopUs;
+    if (dt > benchMaxLoopUs) benchMaxLoopUs = dt;
+    benchMovingLoops++;
+  }
+  benchLastLoopUs = now;
+
+  if (benchBurstSize == 0) return;
+  if (millis() - benchBurstStartMs >= BENCH_BURST_LIMIT_MS) {
+    benchBurstSize = 0;
+    benchReport("ski burst auto-stopped after 30 s");
+    benchLastLoopUs = micros();  // the report itself is not a slow loop
+    return;
+  }
+  if (benchBurstIntervalMs == 0 || millis() - benchBurstLastMs >= benchBurstIntervalMs) {
+    benchBurstLastMs = millis();
+    uint32_t t0 = micros();
+    SERIAL_XB2.write(benchBurstBuf, benchBurstSize);
+    uint32_t dt = micros() - t0;
+    if (dt > benchBurstMaxWriteUs) benchBurstMaxWriteUs = dt;
+    benchBurstCount++;
+  }
+}
+
+static bool benchIsDigit(char c) { return c >= '0' && c <= '9'; }
+
+// True if the byte belonged to a bench command, which then goes no further.
+// No timeout: the radio writes a whole command at once.
+bool benchParseByte(char c) {
+  if (benchCmd != 0) {
+    benchArg[benchGot++] = c;
+    if (benchGot < benchNeed) return true;
+    char cmd = benchCmd;
+    benchCmd = 0;
+
+    if (cmd == '*') {
+      if (benchIsDigit(benchArg[0]) && benchIsDigit(benchArg[1])) {
+        benchBatteryOverride = (benchArg[0] - '0') * 10 + (benchArg[1] - '0');
+        SERIAL_XB2.print("%");
+        SERIAL_XB2.print(benchBatteryOverride);
+        char text[48];
+        snprintf(text, sizeof(text), "battery reported as %d%% until reboot", benchBatteryOverride);
+        benchSendText(text);
+      } else {
+        benchSendText("usage: *nn, two digits");
+      }
+    } else {  // '&'
+      if (benchArg[0] == 'S' && benchIsDigit(benchArg[1]) && benchIsDigit(benchArg[2]) && benchIsDigit(benchArg[3])) {
+        benchBurstStart((benchArg[1] - '0') * 10 + (benchArg[2] - '0'), benchArg[3] - '0');
+      } else {
+        benchSendText("usage: &S, size 00-99, interval 0-9");
+      }
+    }
+    return true;
+  }
+
+  switch (c) {
+    case '&': benchCmd = '&'; benchNeed = 4; benchGot = 0; return true;
+    case '*': benchCmd = '*'; benchNeed = 2; benchGot = 0; return true;
+    case '#': benchReport("stats"); return true;
+  }
+  return false;
+}
+#endif  // BENCH_TOOLS

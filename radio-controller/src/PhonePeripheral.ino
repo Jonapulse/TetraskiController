@@ -137,6 +137,10 @@ void setupPhonePeripheral() {
   );
   pConfigChar->setCallbacks(new ConfigCallbacks());
 
+#if BENCH_TOOLS
+  setupBenchService(pService);  // bench console and echo characteristics, see BenchTools.ino
+#endif
+
   // OTA service lives on the same server as the phone's main service — it's
   // part of the phone-facing peripheral role, just like everything else in
   // this file. Defined in OTAService.ino.

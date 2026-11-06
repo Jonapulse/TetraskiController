@@ -129,6 +129,9 @@ enum SkiRelayState : uint8_t {
 
 static uint8_t  skiRelayState = SKI_RLY_IDLE;
 static volatile bool skiRelayRequested = false;   // set on the BLE host task, picked up by loop()
+#if BENCH_TOOLS
+static volatile bool skiRelayForce = false;       // bench only: relay even if the ski already runs this version or newer
+#endif
 static File     skiRelayFile;
 static uint32_t skiImageSize = 0;    // size and CRC32 of the image being relayed, needed for COMMIT
 static uint32_t skiImageCrc = 0;
@@ -412,7 +415,13 @@ static void skiRelayBegin() {
 
   if (skiVersion.length() == 0) { skiRelayFinish(SKI_UPD_NO_SKI_VERSION); return; }
   if (!skiReadImageVersion(&skiRelayImgVer)) { skiRelayFinish(SKI_UPD_NO_IMAGE_VERSION); return; }
+#if BENCH_TOOLS
+  bool force = skiRelayForce;
+  skiRelayForce = false;
+  if (!force && skiCompareVersions(skiRelayImgVer, skiVersion) <= 0) { skiRelayFinish(SKI_UPD_UP_TO_DATE); return; }
+#else
   if (skiCompareVersions(skiRelayImgVer, skiVersion) <= 0) { skiRelayFinish(SKI_UPD_UP_TO_DATE); return; }
+#endif
 
   skiRelayFile = LittleFS.open(SKI_FW_PATH, "r");
   if (!skiRelayFile || skiRelayFile.size() == 0) { skiRelayFinish(SKI_UPD_NO_IMAGE); return; }
@@ -577,10 +586,10 @@ void consumeSkiBattery() {
   uint8_t digits = 0;
   unsigned long start = millis();
   while (digits < SKI_BATTERY_MAX_DIGITS && millis() - start <= SKI_BATTERY_WAIT_MS) {
-    int c = Serial.peek();
+    int c = skiRxPeek();
     if (c < 0) continue;              // next digit still on the wire
     if (c < '0' || c > '9') break;    // not part of the battery report
-    Serial.read();
+    benchEchoSki(skiRxRead());
     digits++;
   }
 }
@@ -589,6 +598,15 @@ void consumeSkiBattery() {
 void skiRelayRequest() {
   skiRelayRequested = true;
 }
+
+#if BENCH_TOOLS
+// Bench only: same, but skips the version compare, so a bench build can go on
+// at the same version and a release build can go back on afterwards.
+void skiRelayRequestForced() {
+  skiRelayForce = true;
+  skiRelayRequested = true;
+}
+#endif
 
 // True from the phone's relay command until the result has been reported.
 bool skiRelayBusy() {

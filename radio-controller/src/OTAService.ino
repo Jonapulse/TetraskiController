@@ -239,6 +239,12 @@ class OTAControlCallbacks : public NimBLECharacteristicCallbacks {
           sendOTAStatus(OTA_STATUS_ERR_STATE);
           return;
         }
+#if BENCH_TOOLS
+        if (value.size() >= 2 && value[1] == 'F') {  // bench only: 'R' 'F' forces the relay
+          skiRelayRequestForced();
+          break;
+        }
+#endif
         skiRelayRequest();
         break;
       }

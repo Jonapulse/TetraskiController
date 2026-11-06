@@ -15,7 +15,15 @@ QueueHandle_t commandQueue;  //Queue of commands for loop() to handle. Extra ste
 //The chip performs the same across reboots for a simpler user experience.
 #define USE_USER_CONFIG 0 
 
+// BENCH ONLY. 1 adds the test tools in BenchTools.ino (app console, ski passthrough,
+// serial bursts, battery-fix toggle, forced ski relay). Must be 0 for any release.
+#define BENCH_TOOLS 1
+
+#if BENCH_TOOLS
+#define FIRMWARE_VERSION "1.0.11-bench"
+#else
 #define FIRMWARE_VERSION "1.0.11"
+#endif
 
 // Setting to 0 will strip phone broadcasting and interaction.
 // Radiocontroller still functions correctly for transforming sensors to serial output and works in TetraSki
@@ -163,6 +171,18 @@ SensorClientCallbacks sensorClientCallbacks;
 // when default arguments are involved, so they're declared explicitly here.
 void scanAndConnectSensors(bool isReconnect = false);
 bool connectSensors(bool isReconnect = false);
+
+// Ski-side serial input. Bench builds also take bytes the app injects "as if
+// from the ski", and echo what the ski sends to the app (BenchTools.ino).
+#if !BENCH_TOOLS
+int skiRxAvailable() { return Serial.available(); }
+int skiRxPeek() { return Serial.peek(); }
+int skiRxRead() { return Serial.read(); }
+bool benchSkiByte(uint8_t b) { return false; }
+void benchEchoSki(uint8_t b) {}
+bool benchBatteryFixOn() { return true; }
+void benchService() {}
+#endif
 
 #if ENABLE_PHONE_PERIPHERAL
 extern bool phoneConnected;
@@ -364,11 +384,14 @@ void scanAndConnectSensors(bool isReconnect) {
 // --------------------------------------------------
 void loop() {
   //check for incoming comms from TetraSki (not while skiLinkService() is waiting on a reply from the ski)
-  if (!skiLinkBusy() && Serial.available()) {
-    char incomingByte = Serial.read();
-    if (incomingByte == '%') consumeSkiBattery();  // battery digits must not reach handleCommand(), see SkiUpdateService.ino
+  if (!skiLinkBusy() && skiRxAvailable()) {
+    char incomingByte = skiRxRead();
+    if (benchSkiByte(incomingByte)) {}  // bench builds: text reports from a bench ski build
+    else if (incomingByte == '%' && benchBatteryFixOn()) consumeSkiBattery();  // battery digits must not reach handleCommand(), see SkiUpdateService.ino
     else handleCommand(incomingByte, CMD_SRC_SERIAL);
   }
+
+  benchService();  // bench builds only: app console, serial bursts, echo to the app
 
   // After the read above: starting a new exchange clears the receive buffer
   skiLinkService();  // ski version query and firmware relay, see SkiUpdateService.ino
