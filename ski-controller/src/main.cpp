@@ -1386,6 +1386,7 @@ void updateBatteryStats(bool forceUpdate) {
   batteryPercentage=(((batteryVoltage)*(11.111)-355.56));
 
 //Test
+//Test 2
   if(batteryPercentage>100)
     batteryPercentage=100;
 
