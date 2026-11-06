@@ -6,7 +6,7 @@
 #include "SkiUpdate.h"
 
 #define VERSION_MAJOR 2
-#define VERSION_MINOR 6
+#define VERSION_MINOR 7
 #define VERSION_REV 1
 
 SKI_UPDATE_VERSION_TAG(VERSION_MAJOR, VERSION_MINOR, VERSION_REV);
@@ -1374,6 +1374,28 @@ void updateDisplayStats() {
 //***********************************************************************************************************************
 
 
+// --------------------------------------------------
+// Battery report to the EMG radio (SERIAL_XB2).
+// The radio treats every incoming ASCII byte as a possible command
+// ('3'/'4' invert, '5' calibrate, 'o'/'p' sensor count, ...), so the old
+// "%" + ASCII digits format could fire commands (e.g. "%35" = reset
+// inversion then recalibrate). Ski-to-radio data now stays in 0x80-0xFF,
+// where no radio command lives:
+//   [SKI_MSG_BATTERY][0x80 | percent]   percent is 0-100 -> 0x80-0xE4
+// Each byte is safe on its own, so a dropped or misaligned byte can
+// never be read as a command.
+// --------------------------------------------------
+#define SKI_DATA_FLAG   0x80
+#define SKI_MSG_BATTERY 0xF0  // message tags live in 0xF0-0xFE, above any 7-bit value
+
+void sendBatteryToRadio(int percent) {
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  SERIAL_XB2.write((uint8_t)SKI_MSG_BATTERY);
+  SERIAL_XB2.write((uint8_t)(SKI_DATA_FLAG | percent));
+  Serial.println("Sent Battery");
+}
+
 void updateBatteryStats(bool forceUpdate) {
 
   int rawBattery=0;
@@ -1398,18 +1420,14 @@ void updateBatteryStats(bool forceUpdate) {
     battPercent.concat("%");
     display.WriteStr(4, battPercent);
 
-    SERIAL_XB2.print("%");
-    SERIAL_XB2.print(lowestBatteryPercentage);
-    Serial.println("Sent Battery");
+    sendBatteryToRadio(lowestBatteryPercentage);
 
   } else if(forceUpdate) {
     String battPercent = String(lowestBatteryPercentage);
     battPercent.concat("%");
     display.WriteStr(4, battPercent);
 
-        SERIAL_XB2.print("%");
-    SERIAL_XB2.print(lowestBatteryPercentage);
-    Serial.println("Sent Battery");
+    sendBatteryToRadio(lowestBatteryPercentage);
   }
 
   if(lowestBatteryPercentage<=BATT_WARNING && !batteryWarning) {
